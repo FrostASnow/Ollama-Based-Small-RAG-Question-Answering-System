@@ -1,0 +1,493 @@
+"""HTTP 层验收测试（针对真实运行的 uvicorn 服务）。
+
+覆盖前端静态托管、文档上传/列表/删除、检索接口，以及 SSE 流式问答的事件协议。
+即使 Ollama 未启动也能跑：问答接口会走到 error 分支，本测试会断言
+「服务端返回结构化的 error 事件，而不是静默挂断或 500」。
+
+用法（需要先在另一个终端启动服务）：
+    .venv\\Scripts\\python.exe tests\\test_http.py
+    .venv\\Scripts\\python.exe tests\\test_http.py --base http://127.0.0.1:8000
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import httpx
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TMP_ROOT = PROJECT_ROOT / ".tmp" / "tests"
+TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+PASSED = 0
+FAILED = 0
+
+
+def check(label: str, condition: bool, detail: str = "") -> None:
+    global PASSED, FAILED
+    if condition:
+        PASSED += 1
+        print(f"  [PASS] {label}" + (f"  ({detail})" if detail else ""))
+    else:
+        FAILED += 1
+        print(f"  [FAIL] {label}" + (f"  ({detail})" if detail else ""))
+
+
+def section(title: str) -> None:
+    print()
+    print("-" * 70)
+    print(title)
+    print("-" * 70)
+
+
+def parse_sse(text: str) -> list[tuple[str, dict]]:
+    """把 SSE 响应体解析成 [(event, data)]。"""
+    events: list[tuple[str, dict]] = []
+    for frame in text.split("\n\n"):
+        event = None
+        data_lines = []
+        for line in frame.split("\n"):
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+        if event and data_lines:
+            try:
+                events.append((event, json.loads("\n".join(data_lines))))
+            except json.JSONDecodeError:
+                events.append((event, {"_raw": "\n".join(data_lines)}))
+    return events
+
+
+SAMPLE = TMP_ROOT / "http_sample.txt"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base", default="http://127.0.0.1:8000")
+    args = parser.parse_args()
+    base = args.base.rstrip("/")
+
+    print("=" * 70)
+    print("HTTP 层验收测试")
+    print("=" * 70)
+    print(f"目标服务: {base}")
+
+    SAMPLE.parent.mkdir(parents=True, exist_ok=True)
+    SAMPLE.write_text(
+        "《差旅报销管理办法》\n\n"
+        "住宿费一线城市每晚 600 元，其他城市每晚 400 元。"
+        "市内交通费每日上限 80 元。超出标准需部门负责人书面审批。\n\n"
+        "员工应在出差结束后十五个工作日内提交报销单并附全部原始票据。\n",
+        encoding="utf-8",
+    )
+
+    # 等待服务真正就绪。
+    # 在带网络代理的环境里，服务刚启动、端口尚未监听时，首个请求可能收到
+    # 代理返回的 502 而不是连接错误，直接判定失败会造成误报。
+    ready = False
+    with httpx.Client(base_url=base, timeout=5.0) as probe:
+        for _ in range(80):
+            try:
+                if probe.get("/api/health").status_code == 200:
+                    ready = True
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.5)
+
+    if not ready:
+        print(f"\n[FAIL] 服务未就绪：{base}")
+        print("       请先启动： 双击 scripts\\start.cmd")
+        return 1
+    print("服务已就绪。")
+
+    uploaded_doc_id = None
+
+    with httpx.Client(base_url=base, timeout=60.0) as client:
+        # ------------------------------------------------------------------
+        section("1. 健康检查与配置")
+        try:
+            r = client.get("/api/health")
+        except httpx.ConnectError:
+            print(f"\n[FAIL] 无法连接 {base}，请先启动服务：")
+            print("       双击 scripts\\start.cmd")
+            return 1
+
+        check("GET /api/health 返回 200", r.status_code == 200, f"HTTP {r.status_code}")
+        health = r.json()
+
+        # JSON 必须显式声明 charset=utf-8。
+        # 否则 Windows PowerShell 5.1 的 Invoke-RestMethod 会按 ISO-8859-1 解码，
+        # 「离线 RAG 文档问答」会变成「ç¦»çº¿ RAG ææ¡£é®ç」。
+        for path, method, kwargs in [
+            ("/api/health", "GET", {}),
+            ("/api/config", "GET", {}),
+            ("/api/documents", "GET", {}),
+            ("/api/setup", "GET", {}),
+            ("/api/chat", "POST", {"json": {}}),           # 422 校验错误
+            ("/api/documents/nope/chunks", "GET", {}),     # 404
+        ]:
+            resp = client.request(method, path, timeout=30.0, **kwargs)
+            ctype = resp.headers.get("content-type", "")
+            check(f"{method} {path} 声明 charset=utf-8",
+                  "charset=utf-8" in ctype, f"{resp.status_code} {ctype}")
+
+        check("中文在 JSON 往返中保持完整",
+              "离线" in health.get("app_name", ""), health.get("app_name", ""))
+        check("响应含 status 字段", "status" in health, health.get("status", ""))
+        check("声明离线模式", health.get("offline") is True)
+        check("嵌入模型已就绪", health.get("embedding_ready") is True,
+              str(health.get("embedding_model")))
+        check("报告 Ollama 可达性", "ollama_reachable" in health,
+              f"reachable={health.get('ollama_reachable')}")
+        print(f"        status={health.get('status')} "
+              f"ollama_reachable={health.get('ollama_reachable')} "
+              f"llm={health.get('llm_model')} "
+              f"model_available={health.get('llm_model_available')}")
+
+        r = client.get("/api/config")
+        check("GET /api/config 返回 200", r.status_code == 200)
+        config = r.json()
+        check("配置含 top_k", "top_k" in config, str(config.get("top_k")))
+        check("配置含嵌入模型名", "embedding_model_name" in config,
+              str(config.get("embedding_model_name")))
+
+        r = client.get("/api/models")
+        check("GET /api/models 返回 200", r.status_code == 200)
+
+        # ------------------------------------------------------------------
+        section("2. 前端静态资源托管")
+        r = client.get("/")
+        check("GET / 返回 200", r.status_code == 200, f"HTTP {r.status_code}")
+        check("返回 HTML", "text/html" in r.headers.get("content-type", ""))
+        check("HTML 含应用标题", "离线 RAG" in r.text)
+        check("HTML 引用 app.js", "/assets/js/app.js" in r.text)
+
+        for asset, kind in [
+            ("/assets/css/style.css", "text/css"),
+            ("/assets/js/app.js", "javascript"),
+            ("/assets/js/api.js", "javascript"),
+            ("/assets/js/markdown.js", "javascript"),
+        ]:
+            r = client.get(asset)
+            ok = r.status_code == 200 and kind in r.headers.get("content-type", "")
+            check(f"GET {asset}", ok, f"HTTP {r.status_code} {r.headers.get('content-type','')}")
+
+        r = client.get("/")
+        check("index.html 以 module 方式加载入口脚本",
+              'type="module"' in r.text and '/assets/js/app.js' in r.text)
+
+        r = client.get("/assets/js/app.js")
+        check("app.js 使用 ES Module 语法",
+              "import {" in r.text and "from './api.js'" in r.text)
+
+        # 目录穿越不应泄露文件
+        r = client.get("/../backend/app/config.py")
+        check("阻止路径穿越", r.status_code in (400, 403, 404) or "Settings" not in r.text,
+              f"HTTP {r.status_code}")
+
+        # ------------------------------------------------------------------
+        section("3. 文档上传与索引")
+        client.delete("/api/documents")  # 从干净状态开始
+
+        with SAMPLE.open("rb") as handle:
+            r = client.post(
+                "/api/documents/upload",
+                files={"files": (SAMPLE.name, handle, "text/plain")},
+            )
+        check("POST /upload 返回 200", r.status_code == 200, f"HTTP {r.status_code}")
+        results = r.json()
+        check("返回结果数组", isinstance(results, list) and len(results) == 1)
+        doc = results[0]["document"]
+        check("索引状态为 indexed", doc["status"] == "indexed", doc.get("error") or "")
+        check("生成分块数 > 0", doc["chunk_count"] > 0, str(doc["chunk_count"]))
+        uploaded_doc_id = doc["doc_id"]
+
+        r = client.get("/api/documents")
+        listing = r.json()
+        check("GET /api/documents 返回 200", r.status_code == 200)
+        check("列表含 1 个文档", listing["total"] == 1, str(listing["total"]))
+        check("分块统计一致", listing["total_chunks"] == doc["chunk_count"])
+
+        r = client.get(f"/api/documents/{uploaded_doc_id}/chunks")
+        check("分块预览接口可用", r.status_code == 200 and r.json()["returned"] > 0)
+
+        # 不支持的类型应被拒绝且不中断整批
+        with SAMPLE.open("rb") as handle:
+            r = client.post(
+                "/api/documents/upload",
+                files={"files": ("bad.exe", handle, "application/octet-stream")},
+            )
+        check("拒绝不支持的类型", r.status_code == 200)
+        check("失败项标记为 failed", r.json()[0]["document"]["status"] == "failed",
+              r.json()[0]["message"][:60])
+
+        # ------------------------------------------------------------------
+        section("4. 检索接口")
+        r = client.post("/api/search", json={"query": "住宿费一线城市每晚多少钱", "top_k": 3,
+                                             "score_threshold": 0.0})
+        check("POST /api/search 返回 200", r.status_code == 200, f"HTTP {r.status_code}")
+        search_data = r.json()
+        check("返回检索结果", len(search_data["results"]) >= 1,
+              f"{len(search_data['results'])} 条")
+        if search_data["results"]:
+            top = search_data["results"][0]
+            check("结果含来源文件名", bool(top["filename"]), top["filename"])
+            check("结果含相似度分数", isinstance(top["score"], float), str(top["score"]))
+            check("结果含原文片段", len(top["content"]) > 0, f"{len(top['content'])} 字符")
+        check("返回耗时", isinstance(search_data["elapsed_ms"], int))
+
+        # ------------------------------------------------------------------
+        section("5. 流式问答（SSE 协议）")
+        # 无论 Ollama 是否在跑，协议本身都必须成立：
+        #   在跑  -> meta/token/sources/done
+        #   没跑  -> meta/error
+        with client.stream(
+            "POST",
+            "/api/chat",
+            json={"question": "住宿费一线城市每晚多少钱？", "stream": True, "top_k": 2},
+            headers={"Accept": "text/event-stream"},
+            timeout=120.0,
+        ) as response:
+            check("POST /api/chat 返回 200", response.status_code == 200,
+                  f"HTTP {response.status_code}")
+            check("Content-Type 为 text/event-stream",
+                  "text/event-stream" in response.headers.get("content-type", ""),
+                  response.headers.get("content-type", ""))
+            body = "".join(response.iter_text())
+
+        events = parse_sse(body)
+        names = [name for name, _ in events]
+        print(f"        收到事件序列: {names}")
+
+        check("收到事件", len(events) > 0, f"{len(events)} 个")
+        check("首个事件为 meta", names and names[0] == "meta", names[0] if names else "无")
+
+        meta = next((d for n, d in events if n == "meta"), {})
+        check("meta 含模型名", bool(meta.get("model")), str(meta.get("model")))
+        check("meta 报告召回数量", meta.get("source_count", 0) >= 1,
+              str(meta.get("source_count")))
+
+        if "error" in names:
+            error = next(d for n, d in events if n == "error")
+            print(f"        Ollama 未运行，走 error 分支：{str(error.get('message'))[:90]}")
+            check("error 事件含可读信息", len(str(error.get("message", ""))) > 5)
+            check("error 事件标注阶段", "stage" in error, str(error.get("stage")))
+        else:
+            check("收到 token 事件", "token" in names)
+            check("收到 sources 事件", "sources" in names)
+            check("以 done 结尾", names[-1] == "done", names[-1])
+            answer = "".join(d.get("delta", "") for n, d in events if n == "token")
+            check("回答非空", len(answer.strip()) > 0, f"{len(answer)} 字符")
+            print(f"        回答（前 120 字）：{answer[:120]}")
+
+        # ------------------------------------------------------------------
+        section("6. 文档删除")
+        r = client.delete(f"/api/documents/{uploaded_doc_id}")
+        check("DELETE 单个文档返回 200", r.status_code == 200, f"HTTP {r.status_code}")
+        check("报告删除的分块数", r.json()["deleted_chunks"] > 0,
+              str(r.json()["deleted_chunks"]))
+
+        r = client.get("/api/documents")
+        check("列表已清空", r.json()["total"] == 0, str(r.json()["total"]))
+
+        r = client.get(f"/api/documents/{uploaded_doc_id}/chunks")
+        check("已删除文档返回 404", r.status_code == 404, f"HTTP {r.status_code}")
+
+        # 知识库为空时问答应给出 409 而不是崩溃
+        r = client.post("/api/chat", json={"question": "测试", "stream": False})
+        check("空知识库问答返回 409", r.status_code == 409, f"HTTP {r.status_code}")
+        check("409 附带可读提示", "上传文档" in r.json().get("detail", ""),
+              r.json().get("detail", "")[:60])
+
+        # ------------------------------------------------------------------
+        section("7. 首次配置引导（/api/setup）")
+        r = client.get("/api/setup", timeout=30.0)
+        check("GET /api/setup 返回 200", r.status_code == 200, f"HTTP {r.status_code}")
+        setup = r.json()
+
+        for field in ("ready", "blocking_count", "headline", "issues", "environment",
+                      "checked_at"):
+            check(f"响应含 {field}", field in setup)
+
+        # 与 /api/health 的判定必须一致，否则前端会误导用户。
+        # 注意 Ollama 是否「装全」也要算进去：只有 ollama.exe 时服务照样可达、
+        # 模型照样列得出来，但一发提问就失败 —— 那种情况下 setup 必须判为未就绪。
+        install = health.get("detail", {}).get("ollama_install") or {}
+        expect_ready = bool(
+            health.get("ollama_reachable")
+            and health.get("llm_model_available")
+            and health.get("embedding_ready")
+            and install.get("complete") is not False
+        )
+        check("ready 与 /api/health 判定一致", setup["ready"] == expect_ready,
+              f"setup.ready={setup['ready']} 期望={expect_ready}")
+
+        # 反向也一致：health 报出的每个问题，setup 都必须给出可执行解决方案
+        health_problems = health.get("detail", {}).get("problems", [])
+        if health_problems:
+            check("health 有问题时 setup 判为未就绪", setup["ready"] is False,
+                  str(health_problems))
+
+        computed_blocking = sum(1 for i in setup["issues"] if i["severity"] == "blocking")
+        check("blocking_count 与 issues 一致",
+              setup["blocking_count"] == computed_blocking,
+              f"字段={setup['blocking_count']} 实际={computed_blocking}")
+
+        if setup["ready"]:
+            check("就绪时 issues 为空", setup["issues"] == [])
+        else:
+            check("未就绪时至少有一个问题", len(setup["issues"]) >= 1,
+                  f"{len(setup['issues'])} 项")
+
+        # 每个问题都必须给出可执行的解决方案，否则这个弹窗就是死胡同
+        for issue in setup["issues"]:
+            check(f"问题「{issue['id']}」有解决方案", len(issue["options"]) >= 1)
+            check(f"问题「{issue['id']}」有影响的说明", bool(issue["impact"]))
+            total_commands = sum(len(o["commands"]) for o in issue["options"])
+            check(f"问题「{issue['id']}」提供了命令", total_commands >= 1,
+                  f"{total_commands} 条")
+            check(f"问题「{issue['id']}」标注了推荐方案",
+                  any(o["recommended"] for o in issue["options"]))
+
+        # 命令里必须是真实绝对路径，不能有未替换的占位符
+        all_commands = [
+            cmd["command"]
+            for issue in setup["issues"]
+            for option in issue["options"]
+            for cmd in option["commands"]
+        ]
+        placeholder_hits = [
+            c for c in all_commands
+            if any(tok in c for tok in ("<PROJECT", "${", "{project", "TODO", "None"))
+        ]
+        check("命令不含未替换的占位符", not placeholder_hits,
+              placeholder_hits[0][:70] if placeholder_hits else "")
+
+        project_root = setup["environment"]["project_root"]
+        # 引用项目内脚本/可执行文件的命令必须是绝对路径，
+        # 否则用户复制到别的目录执行就会找不到文件
+        relative_hits = [
+            c for c in all_commands
+            if ("scripts\\" in c or "tools\\" in c or ".venv" in c)
+            and project_root not in c
+        ]
+        check("脚本命令使用绝对路径", not relative_hits,
+              relative_hits[0][:70] if relative_hits else f"{len(all_commands)} 条命令")
+
+        check("环境信息含项目根", bool(project_root), project_root)
+        check("环境信息含 ollama 探测结果",
+              "ollama_binary" in setup["environment"] and "ollama_reachable" in setup["environment"])
+
+        # 如果检测到二进制，路径必须真实存在
+        binary = setup["environment"]["ollama_binary"]
+        if binary.get("found"):
+            check("报告的 ollama 路径真实存在", Path(binary["path"]).is_file(), binary["path"])
+
+        # fresh=true 绕缓存，必须同样可用
+        r = client.get("/api/setup?fresh=true", timeout=30.0)
+        check("?fresh=true 可用", r.status_code == 200 and "ready" in r.json())
+
+        print(f"        当前判定: ready={setup['ready']} · {setup['headline']}")
+        for issue in setup["issues"]:
+            print(f"        - [{issue['severity']}] {issue['title']} "
+                  f"({len(issue['options'])} 个方案)")
+
+        # --- 环境探测（指引要基于真实路径，而不是写死的模板）---
+        toolchain = setup["environment"].get("toolchain")
+        check("环境信息含工具链探测", isinstance(toolchain, dict), str(type(toolchain)))
+        if isinstance(toolchain, dict):
+            for tool in ("uv", "node", "venv", "powershell"):
+                check(f"探测了 {tool}", tool in toolchain)
+            check("uv 探测结果结构正确",
+                  set(toolchain["uv"]) >= {"found", "path", "source"},
+                  str(toolchain["uv"]))
+            if toolchain["uv"]["found"]:
+                check("报告的 uv 路径真实存在",
+                      Path(toolchain["uv"]["path"]).is_file(), toolchain["uv"]["path"])
+
+        check("提供一键安装能力开关",
+              isinstance(setup["environment"].get("can_auto_install"), bool),
+              str(setup["environment"].get("can_auto_install")))
+
+        # ------------------------------------------------------------------
+        section("8. 一键安装接口")
+
+        r = client.get("/api/setup/install", timeout=15.0)
+        check("GET /api/setup/install 返回 200", r.status_code == 200, f"HTTP {r.status_code}")
+        status = r.json()
+        for field in ("status", "running", "started_at", "returncode", "log_file"):
+            check(f"状态含 {field}", field in status)
+
+        # 清理上一次测试可能残留的状态
+        client.post("/api/setup/install/reset", timeout=15.0)
+
+        # 用 skip_ollama 跳过 1.4GB 下载，让测试保持快速
+        r = client.post("/api/setup/install", json={"skip_ollama": True}, timeout=20.0)
+        check("POST /api/setup/install 返回 200", r.status_code == 200, f"HTTP {r.status_code}")
+        check("返回已开始", r.json().get("started") is True)
+
+        # 并发保护：同一时间只允许一个安装任务
+        r = client.post("/api/setup/install", json={"skip_ollama": True}, timeout=20.0)
+        check("重复发起返回 409", r.status_code == 409, f"HTTP {r.status_code}")
+
+        r = client.get("/api/setup/install", timeout=15.0)
+        check("运行中时 running 为 true", r.json().get("running") is True,
+              str(r.json().get("status")))
+
+        # SSE：至少要能收到服务端头部日志
+        got_lines = 0
+        saw_end = False
+        with client.stream("GET", "/api/setup/install/stream", timeout=60.0) as response:
+            check("安装日志流 Content-Type 正确",
+                  "text/event-stream" in response.headers.get("content-type", ""),
+                  response.headers.get("content-type", ""))
+            event = None
+            for raw in response.iter_lines():
+                if raw.startswith("event:"):
+                    event = raw[6:].strip()
+                elif raw.startswith("data:") and event == "log":
+                    got_lines += 1
+                    if got_lines >= 5:
+                        break
+
+        check("收到安装日志", got_lines >= 1, f"{got_lines} 行")
+
+        # 取消：按进程树终止，避免留下孤儿子进程。
+        # 若安装跑得很快（依赖已缓存时几秒就结束），这里可能已经没什么可取消的，
+        # 那 409 也是正确行为 —— 断言放宽，避免测试本身变成随机失败源。
+        r = client.post("/api/setup/install/cancel", timeout=30.0)
+        check("取消安装返回 200 或 409（任务已结束）",
+              r.status_code in (200, 409), f"HTTP {r.status_code}")
+
+        # 等状态落定
+        for _ in range(20):
+            snapshot = client.get("/api/setup/install", timeout=10.0).json()
+            if not snapshot["running"]:
+                break
+            time.sleep(0.5)
+
+        check("取消后不再运行", snapshot["running"] is False, str(snapshot["status"]))
+        check("状态标记为 cancelled 或已结束",
+              snapshot["status"] in ("cancelled", "failed", "succeeded"),
+              str(snapshot["status"]))
+
+        r = client.post("/api/setup/install/reset", timeout=15.0)
+        check("reset 后回到 idle", r.json().get("status") == "idle", str(r.json().get("status")))
+
+    print()
+    print("=" * 70)
+    print(f"结果：通过 {PASSED} 项，失败 {FAILED} 项")
+    print("=" * 70)
+    return 0 if FAILED == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
