@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>离线 RAG 文档问答</title>
+<link rel="stylesheet" href="/assets/css/style.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>" />
+</head>
+<body>
+
+<div id="app" class="app">
+
+  <!-- ================= 侧边栏 ================= -->
+  <aside class="sidebar" id="sidebar">
+    <header class="sidebar__head">
+      <div class="brand">
+        <span class="brand__dot" id="statusDot" title="服务状态"></span>
+        <div class="brand__text">
+          <strong>离线 RAG 问答</strong>
+          <small id="statusText">正在检查服务…</small>
+        </div>
+      </div>
+      <button class="icon-btn" id="toggleSidebar" title="收起/展开侧栏" aria-label="收起侧栏">‹</button>
+    </header>
+
+    <!-- 配置未完成时的常驻入口（点击可重新打开引导弹窗） -->
+    <button class="setup-banner" id="setupBanner" hidden type="button">
+      <span class="setup-banner__icon" aria-hidden="true">!</span>
+      <span class="setup-banner__text">
+        <strong id="setupBannerTitle">配置未完成</strong>
+        <small id="setupBannerText">点击查看安装方式</small>
+      </span>
+    </button>
+
+    <!-- 上传 -->
+    <section class="panel">
+      <h2 class="panel__title">知识库</h2>
+      <div class="dropzone" id="dropzone" tabindex="0" role="button"
+           aria-label="点击或拖拽文件到此处上传">
+        <svg viewBox="0 0 24 24" class="dropzone__icon" aria-hidden="true">
+          <path d="M12 16V4m0 0L8 8m4-4 4 4" fill="none" stroke="currentColor" stroke-width="1.8"
+                stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor"
+                stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+        <p class="dropzone__main">点击或拖拽文件到此处</p>
+        <p class="dropzone__hint" id="dropzoneHint">支持 PDF / Word / Markdown / TXT / CSV</p>
+        <input type="file" id="fileInput" multiple hidden />
+      </div>
+      <div class="upload-progress" id="uploadProgress" hidden>
+        <div class="upload-progress__bar"><span id="uploadBar"></span></div>
+        <small id="uploadLabel">正在上传…</small>
+      </div>
+    </section>
+
+    <!-- 文档列表 -->
+    <section class="panel panel--grow">
+      <div class="panel__title-row">
+        <h2 class="panel__title">
+          已索引文档 <span class="badge" id="docCount">0</span>
+        </h2>
+        <button class="text-btn" id="clearAllBtn" title="清空知识库">清空</button>
+      </div>
+      <ul class="doc-list" id="docList"></ul>
+      <p class="empty-hint" id="docEmpty">还没有文档，先上传一些资料吧。</p>
+    </section>
+
+    <!-- 检索参数 -->
+    <section class="panel">
+      <h2 class="panel__title">检索参数</h2>
+      <div class="field">
+        <label for="topK">召回片段数 <output id="topKOut">4</output></label>
+        <input type="range" id="topK" min="1" max="10" step="1" value="4" />
+      </div>
+      <div class="field">
+        <label for="threshold">相似度阈值 <output id="thresholdOut">0.20</output></label>
+        <input type="range" id="threshold" min="0" max="0.8" step="0.05" value="0.2" />
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="thinkingToggle" checked />
+        <span>显示模型推理过程</span>
+      </label>
+    </section>
+  </aside>
+
+  <!-- ================= 主区域 ================= -->
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn icon-btn--ghost" id="openSidebar" title="展开侧栏" hidden>›</button>
+      <div class="topbar__title">
+        <h1>文档问答</h1>
+        <small id="modelLabel">模型：—</small>
+      </div>
+      <div class="topbar__actions">
+        <button class="btn btn--ghost" id="newChatBtn">新对话</button>
+        <button class="btn btn--ghost" id="healthBtn">系统状态</button>
+      </div>
+    </header>
+
+    <div class="chat" id="chat">
+      <div class="welcome" id="welcome">
+        <div class="welcome__icon">📚</div>
+        <h2>基于本地文档回答问题</h2>
+        <p>
+          全部计算都在本机完成：<strong>Ollama</strong> 负责生成，
+          <strong>FAISS + all-MiniLM-L6-v2</strong> 负责检索，不联网、不上传任何数据。
+        </p>
+        <ul class="welcome__steps">
+          <li>1. 在左侧上传 PDF / Word / Markdown / TXT 文档</li>
+          <li>2. 等待索引进度完成</li>
+          <li>3. 直接在下方提问，回答会标注引用来源</li>
+        </ul>
+        <div class="welcome__examples" id="examples"></div>
+      </div>
+    </div>
+
+    <footer class="composer">
+      <div class="composer__box">
+        <textarea id="question" rows="1" placeholder="就你的文档提问，例如：这份方案的核心结论是什么？"
+                  autocomplete="off"></textarea>
+        <button class="send-btn" id="sendBtn" title="发送 (Enter)" aria-label="发送">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 12l16-8-6 8 6 8-16-8z" fill="currentColor"/>
+          </svg>
+        </button>
+      </div>
+      <div class="composer__foot">
+        <span id="composerHint">Enter 发送 · Shift+Enter 换行</span>
+        <button class="text-btn danger" id="stopBtn" hidden>停止生成</button>
+      </div>
+    </footer>
+  </main>
+</div>
+
+<!-- ================= 抽屉：系统状态 ================= -->
+<div class="drawer" id="healthDrawer" hidden>
+  <div class="drawer__backdrop" data-close></div>
+  <div class="drawer__panel" role="dialog" aria-label="系统状态">
+    <header class="drawer__head">
+      <h2>系统状态</h2>
+      <button class="icon-btn" data-close aria-label="关闭">×</button>
+    </header>
+    <div class="drawer__body" id="healthBody"></div>
+  </div>
+</div>
+
+<!-- ================= 抽屉：来源详情 ================= -->
+<div class="drawer" id="sourceDrawer" hidden>
+  <div class="drawer__backdrop" data-close></div>
+  <div class="drawer__panel" role="dialog" aria-label="引用来源">
+    <header class="drawer__head">
+      <h2 id="sourceDrawerTitle">引用来源</h2>
+      <button class="icon-btn" data-close aria-label="关闭">×</button>
+    </header>
+    <div class="drawer__body" id="sourceBody"></div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<!-- ================= 首次配置引导弹窗 ================= -->
+<div class="modal" id="setupModal" hidden>
+  <div class="modal__backdrop" data-setup-dismiss></div>
+  <div class="modal__panel" role="dialog" aria-modal="true" aria-labelledby="setupTitle">
+    <header class="modal__head">
+      <div class="modal__heading">
+        <h2 id="setupTitle">完成首次配置</h2>
+        <p id="setupSubtitle">正在检测运行环境…</p>
+      </div>
+      <button class="icon-btn" data-setup-dismiss aria-label="关闭">×</button>
+    </header>
+
+    <div class="modal__body" id="setupBody">
+      <div class="setup-loading"><span class="dots"><span></span><span></span><span></span></span></div>
+    </div>
+
+    <!-- 一键安装：实时日志控制台 -->
+    <div class="modal__body modal__body--install" id="setupInstallPanel" hidden>
+      <div class="install-head">
+        <span class="install-state" id="installState">正在准备环境…</span>
+        <span class="install-elapsed" id="installElapsed"></span>
+      </div>
+      <p class="install-hint">
+        安装过程可能需要十几分钟（Ollama 约 1.4GB、模型约 1.1GB）。
+        可以关闭这个窗口，安装会在后台继续，左侧入口可随时回来看进度。
+      </p>
+      <pre class="install-log" id="installLog" aria-live="polite"></pre>
+
+      <!-- 失败后的出路：不能只丢一句 WARN 让用户干瞪眼 -->
+      <div class="install-actions" id="installActions" hidden>
+        <p class="install-actions__hint" id="installActionHint"></p>
+        <div class="install-actions__row">
+          <button class="btn btn--primary" id="installRetry">重新安装</button>
+          <button class="btn" id="installRetryMirror">用国内镜像重试</button>
+          <button class="btn btn--ghost" id="installManual">查看手动命令</button>
+        </div>
+      </div>
+    </div>
+
+    <footer class="modal__foot">
+      <button class="text-btn" id="setupMute" title="之后不再自动弹出（仍可从左侧入口打开）">不再自动提示</button>
+      <div class="modal__foot-actions">
+        <button class="btn btn--ghost" id="setupCancelInstall" hidden>取消安装</button>
+        <button class="btn btn--ghost" id="setupLater">稍后再说</button>
+        <button class="btn btn--primary" id="setupAutoInstall" hidden>一键开始安装</button>
+        <button class="btn btn--primary" id="setupRecheck">重新检测</button>
+      </div>
+    </footer>
+  </div>
+</div>
+
+<script type="module" src="/assets/js/app.js"></script>
+</body>
+</html>
