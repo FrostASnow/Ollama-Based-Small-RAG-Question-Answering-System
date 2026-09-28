@@ -1,0 +1,38 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.uv/
+
+# ---- 运行时数据（保留目录，忽略内容）----
+data/uploads/*
+data/index/*
+data/logs/*
+!data/uploads/.gitkeep
+!data/index/.gitkeep
+!data/logs/.gitkeep
+
+# ---- 模型与工具（体积大，用脚本重新获取）----
+models/*
+!models/.gitkeep
+tools/*.zip
+tools/ollama/
+
+# ---- 缓存与临时文件 ----
+.hf-cache/
+.tmp/
+*.log
+
+# 早期用 tempfile.mkdtemp 做诊断时留下的目录（当前代码已不再产生）
+/diag/
+
+# ---- 本地配置 ----
+.env
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
