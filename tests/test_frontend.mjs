@@ -138,6 +138,71 @@ check('renderPlain 保留换行', renderPlain('第一行\n第二行').includes('
 check('renderPlain 也做转义', !renderPlain('<script>x</script>').includes('<script>'));
 
 /* ================================================================== */
+section('4b. 列表渲染（用户实测：分点全都显示成「1.」）');
+
+// 真实故障：deepseek-r1:1.5b 的输出形如
+//     1. **特征提取的普适性**  （行尾两空格）
+//        多任务网络通过共享特征提取器……
+// 旧渲染器把缩进的说明行当成普通段落 → 列表被段落切断 → 每个要点各自成为
+// 一个只有一项的 <ol>，浏览器于是把**每一条**都编号成 1。
+const modelOutput = [
+  '多任务网络的优势主要体现在以下几个方面：',
+  '',
+  '1. **特征提取的普适性**  ',
+  '   多任务网络通过共享特征提取器，提取出的特征能够适用于多个任务。',
+  '',
+  '2. **减少数据和参数**  ',
+  '   通过共享卷积网络减少了参数数量。',
+  '',
+  '综上所述，多任务网络表现优异。',
+].join('\n');
+const modelHtml = renderMarkdown(modelOutput);
+const orderedCount = (modelHtml.match(/<ol>/g) || []).length;
+const itemCount = (modelHtml.match(/<li>/g) || []).length;
+check('模型真实输出只生成一个有序列表', orderedCount === 1, `实际 ${orderedCount} 个 <ol>`);
+check('两个要点都在同一个列表里', itemCount === 2, `实际 ${itemCount} 个 <li>`);
+check('续行说明归入同一个 <li>（不再跑到列表外）',
+  modelHtml.includes('<strong>特征提取的普适性</strong><br />多任务网络通过共享特征提取器'));
+check('列表之后的独立段落仍在列表外',
+  modelHtml.includes('</ol>') && modelHtml.trim().endsWith('</p>'));
+
+const loose = renderMarkdown('1. 甲\n\n2. 乙\n\n3. 丙');
+check('空行分隔的松散列表不拆成多个 <ol>',
+  (loose.match(/<ol>/g) || []).length === 1 && (loose.match(/<li>/g) || []).length === 3,
+  loose.replace(/\n/g, ''));
+
+const repeated = renderMarkdown('1. 甲\n\n1. 乙\n\n1. 丙');
+check('模型重复写 1. 时按顺序重新编号（不再是 1.1.1.）',
+  (repeated.match(/<ol>/g) || []).length === 1
+  && (repeated.match(/<li>/g) || []).length === 3
+  && !repeated.includes('start='),
+  repeated.replace(/\n/g, ''));
+
+check('全角句点序号（1．）也认', renderMarkdown('1．甲\n2．乙').includes('<ol>'));
+check('中文顿号序号（1、）也认', renderMarkdown('1、甲\n2、乙').includes('<ol>'));
+check('起始序号不是 1 时保留（start 属性）',
+  renderMarkdown('3. 甲\n4. 乙').includes('<ol start="3">'));
+
+const nested = renderMarkdown('- 甲\n  - 子项一\n  - 子项二\n- 乙');
+check('缩进子项渲染成嵌套列表',
+  /<li>甲<ul>/.test(nested) && (nested.match(/<ul>/g) || []).length === 2,
+  nested.replace(/\n/g, ''));
+
+check('正文里的年份不会被当成列表',
+  !renderMarkdown('2020 年第 2 期\n图 8 每张图的人脸关键点').includes('<li>'));
+check('小数不会被当成有序列表',
+  !renderMarkdown('3.14 是圆周率，2.71 是自然常数').includes('<li>'));
+check('分割线不会被当成列表项', renderMarkdown('- - -').includes('<hr />'));
+check('紧跟随行（lazy continuation）归入列表项',
+  renderMarkdown('1. 甲\n这是甲的说明').includes('<li>甲<br />这是甲的说明</li>'));
+check('硬换行（行尾两空格）保留为 <br />',
+  renderMarkdown('第一行。  \n第二行。').includes('第一行。<br />第二行。'));
+check('导出的 matchListItem 可单独使用',
+  typeof mod.matchListItem === 'function'
+  && mod.matchListItem('1. 甲')?.text === '甲'
+  && mod.matchListItem('2020 年第 2 期') === null);
+
+/* ================================================================== */
 section('5. 静态一致性（DOM id 与模块导出）');
 
 const html = await readFile(join(root, 'frontend', 'index.html'), 'utf8');
@@ -242,7 +307,6 @@ for (const cls of conflicting) {
 
 /* ================================================================== */
 section('7. 环境面板与后端探测字段一致');
-
 // 真实故障：便携版 Ollama 只装了一半（只有 ollama.exe，缺 lib\ollama 下的
 // 推理引擎）。此时服务能启动、模型也能列出，但一提问就报
 // llama-server binary not found。如果面板只看「文件在不在」就写「已就绪」，
@@ -257,6 +321,32 @@ check('不完整时在提示里说明缺什么',
   /llama-server\.exe/.test(appSrc), 'tooltip 应指出缺推理引擎');
 check('徽标支持自定义文案（不完整 / 缺失 / 已就绪）',
   /okLabel\s*\|\|\s*'已就绪'/.test(appSrc) && /okLabel\s*\|\|\s*'缺失'/.test(appSrc));
+
+/* ================================================================== */
+section('8. 检索策略徽标与重建索引入口');
+
+// 后端会把「这轮用的是概览检索」和「阈值内没命中、已自动放宽」下发到 meta 事件。
+// 界面必须显式告诉用户，否则他会把概览结果当成普通问答结果。
+check('app.js 消费 meta.mode', /data\.mode\s*===\s*'overview'/.test(appSrc));
+check('app.js 消费 meta.relaxed', /data\.relaxed/.test(appSrc));
+check('概览徽标文案存在', /全文概览/.test(appSrc));
+check('放宽阈值徽标文案存在', /已放宽阈值/.test(appSrc));
+check('徽标里说明生效阈值与最佳分数',
+  /effective_threshold/.test(appSrc) && /best_score/.test(appSrc));
+check('元信息渲染函数可被单独阅读（不是内联拼字符串）',
+  /function renderMetaLine/.test(appSrc));
+
+// 解析/切分逻辑升级后旧索引不会自动更新，界面必须提供重建入口
+check('index.html 提供重建索引按钮', /id="reindexBtn"/.test(html));
+check('app.js 绑定重建索引按钮', /el\.reindexBtn\.addEventListener/.test(appSrc));
+check('api.js 导出 reindexDocuments', /export function reindexDocuments/.test(apiSrc));
+check('重建走 /api/documents/reindex',
+  /\/api\/documents\/reindex/.test(apiSrc) && /method:\s*'POST'/.test(apiSrc));
+check('重建前有二次确认（会用新配置重新分块）',
+  /reindexBtn\.addEventListener[\s\S]{0,400}window\.confirm/.test(appSrc));
+
+check('样式表定义了徽标样式', /\.tag--warn/.test(css) && /\.tag--mode/.test(css));
+check('嵌套列表有收紧间距的样式', /\.md li > ul/.test(css));
 
 /* ================================================================== */
 console.log('');

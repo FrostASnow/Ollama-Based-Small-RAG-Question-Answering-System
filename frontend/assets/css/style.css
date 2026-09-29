@@ -354,6 +354,16 @@ input[type="range"]::-moz-range-thumb {
   display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
 }
 
+/* 回答元信息里的小徽标：全文概览 / 已放宽阈值 / 低置信度 */
+.tag {
+  display: inline-block; padding: 1px 7px; border-radius: 9px;
+  font-size: 11px; line-height: 15px; font-weight: 500;
+  border: 1px solid transparent; white-space: nowrap;
+}
+.tag--mode { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-soft); }
+.tag--warn { background: rgba(217, 119, 6, .12); color: var(--warn); border-color: rgba(217, 119, 6, .3); }
+.tag--faint { background: var(--bg-sunken); color: var(--text-faint); border-color: var(--border); }
+
 /* Markdown 排版 */
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
@@ -363,6 +373,9 @@ input[type="range"]::-moz-range-thumb {
 .md h3 { font-size: 15px; } .md h4 { font-size: 14px; }
 .md ul, .md ol { margin: 0 0 10px; padding-left: 22px; }
 .md li { margin: 3px 0; }
+/* 嵌套列表：紧贴父条目，减少额外的垂直空隙 */
+.md li > ul, .md li > ol { margin: 3px 0 0; }
+.md li > ul > li, .md li > ol > li { margin: 2px 0; }
 .md code {
   font-family: var(--mono); font-size: 12.5px;
   background: var(--bg-sunken); padding: 1.5px 5px; border-radius: 4px;

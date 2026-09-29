@@ -162,6 +162,14 @@ export function clearAllDocuments() {
 }
 
 /**
+ * 用原始文件按当前解析/切分配置重建整个索引。
+ * 解析逻辑（页眉过滤、分块大小）更新后，旧索引不会自动跟着变，需要重建。
+ */
+export function reindexDocuments() {
+  return request('/api/documents/reindex', { method: 'POST' });
+}
+
+/**
  * 上传文件。用 XMLHttpRequest 是为了拿到上传进度
  * （fetch 目前无法可靠上报请求体进度）。
  * @param {File[]} files

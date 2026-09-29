@@ -56,6 +56,157 @@ function splitRow(line) {
   return line.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
 }
 
+function isThematicBreak(line) {
+  return /^\s*([-*_])\s*\1\s*\1[\s\-*_]*$/.test(line);
+}
+
+/** 前导空白宽度（制表符按 4 列算）。 */
+function indentWidth(prefix) {
+  let width = 0;
+  for (const ch of prefix) width += ch === '\t' ? 4 : 1;
+  return width;
+}
+
+const BULLET_MARKER = /^([ \t]*)([-*+•·])\s+(.*)$/;
+// 兼容模型实际会写出的各种序号：`1.` `1．` `1、` `1)` `（1）`，以及中文里
+// 「1．标题」这种**序号后没有空格**的写法。
+const ORDERED_MARKER = /^([ \t]*)(\d{1,3})([.．、)）])(\s*)(.*)$/;
+
+/**
+ * 解析列表项行；不是列表项则返回 null。
+ *
+ * 这里刻意要求「序号后面必须有标点」，否则正文里的「2020 年第 2 期」
+ * 「图 8 每张图」都会被误判成列表项。
+ */
+export function matchListItem(line) {
+  const bullet = line.match(BULLET_MARKER);
+  if (bullet) {
+    const text = bullet[3].trim();
+    if (!text) return null;
+    return { indent: indentWidth(bullet[1]), type: 'ul', start: 1, text };
+  }
+  const ordered = line.match(ORDERED_MARKER);
+  if (ordered) {
+    const punctuation = ordered[3];
+    const gap = ordered[4];
+    // 「3.14 是圆周率」不是列表：ASCII 的 . 和 ) 后面必须跟空白
+    if ((punctuation === '.' || punctuation === ')') && !gap) return null;
+    const text = ordered[5].trim();
+    if (!text) return null;
+    return { indent: indentWidth(ordered[1]), type: 'ol', start: Number(ordered[2]), text };
+  }
+  return null;
+}
+
+/** 这些行出现即代表列表结束（属于别的块级语法）。 */
+function endsList(line) {
+  return /^\s*```/.test(line)
+    || /^#{1,6}\s/.test(line)
+    || /^\s*>/.test(line)
+    || isThematicBreak(line)
+    || isTableSeparator(line);
+}
+
+function newFrame(item, owner) {
+  return { type: item.type, start: item.start, indent: item.indent, items: [], owner };
+}
+
+function serializeItem(item) {
+  const parts = item.parts.map((part) => renderInline(part));
+  let html = parts[0] || '';
+  for (let i = 1; i < parts.length; i += 1) {
+    // 续行（模型常见的「- **要点**」换行后接说明）放在同一个 <li> 里，
+    // 否则每个要点都会变成一个独立的单元素列表，序号全是 1。
+    html += `<br />${parts[i]}`;
+  }
+  for (const child of item.children) html += serializeFrame(child);
+  return `<li>${html}</li>`;
+}
+
+function serializeFrame(frame) {
+  const start = frame.type === 'ol' && frame.start && frame.start !== 1
+    ? ` start="${frame.start}"` : '';
+  const inner = frame.items.map(serializeItem).join('\n');
+  return `<${frame.type}${start}>${inner}</${frame.type}>`;
+}
+
+/**
+ * 从 start 行开始解析一整块列表，返回 `{ html, next }`。
+ *
+ * 与最初的实现相比，这里修掉了三个真实故障：
+ *   1. 空行会关闭列表 → 每个要点各自成为一个 `<ol>`，浏览器把**每一段**都编号成 1。
+ *      现在空行只把列表标记为「松散」，序号继续往下排。
+ *   2. 缩进的续行被当成普通段落 → 说明文字跑到列表外面，和要点脱节。
+ *      现在缩进 ≥ 内容列（或无空行的紧跟随行）都归入当前 `<li>`。
+ *   3. 完全没有嵌套支持 → 子列表被拉平成同级项。现在按缩进建树。
+ */
+function parseListBlock(lines, start) {
+  const rootLists = [];
+  const stack = [];          // 打开的列表帧，栈顶是最深的一层
+  let index = start;
+  let pendingBlank = false;  // 上一行是否为空行
+
+  while (index < lines.length) {
+    const line = lines[index];
+
+    if (!line.trim()) {
+      pendingBlank = true;
+      index += 1;
+      continue;
+    }
+    if (endsList(line)) break;
+
+    const item = matchListItem(line);
+
+    if (item) {
+      while (stack.length && item.indent < stack[stack.length - 1].indent) stack.pop();
+
+      let frame = stack[stack.length - 1];
+      if (!frame) {
+        frame = newFrame(item, null);
+        rootLists.push(frame);
+        stack.push(frame);
+      } else if (item.indent > frame.indent) {
+        // 缩进更深 → 作为上一个条目的子列表
+        const parent = frame.items[frame.items.length - 1];
+        const child = newFrame(item, parent);
+        parent.children.push(child);
+        stack.push(child);
+        frame = child;
+      } else if (item.type !== frame.type) {
+        // 同层级但换了标记类型（`-` 变 `1.`）→ 另起一个并列列表
+        const sibling = newFrame(item, frame.owner);
+        if (frame.owner) frame.owner.children.push(sibling);
+        else rootLists.push(sibling);
+        stack[stack.length - 1] = sibling;
+        frame = sibling;
+      }
+
+      frame.items.push({ parts: [item.text], children: [] });
+      pendingBlank = false;
+      index += 1;
+      continue;
+    }
+
+    // 非列表行：可能是上一个条目的续行
+    const frame = stack[stack.length - 1];
+    const last = frame && frame.items[frame.items.length - 1];
+    if (last) {
+      const indent = indentWidth(line.match(/^[ \t]*/)[0]);
+      const contentIndent = frame.indent + 3;   // 标记 + 一个空格所占的列
+      if (!pendingBlank || indent >= contentIndent) {
+        last.parts.push(line.trim());
+        pendingBlank = false;
+        index += 1;
+        continue;
+      }
+    }
+    break;
+  }
+
+  return { html: rootLists.map(serializeFrame).join('\n'), next: index };
+}
+
 /**
  * 把 Markdown 文本渲染成 HTML 字符串。
  * @param {string} source
@@ -68,19 +219,26 @@ export function renderMarkdown(source) {
   let inCode = false;
   let codeLang = '';
   let codeLines = [];
-  let listType = null;   // 'ul' | 'ol'
   let paragraph = [];
 
-  const closeList = () => {
-    if (listType) { html.push(`</${listType}>`); listType = null; }
-  };
   const flushParagraph = () => {
-    if (paragraph.length) {
-      html.push(`<p>${renderInline(paragraph.join(' '))}</p>`);
-      paragraph = [];
+    if (!paragraph.length) return;
+    // 两个以上空格结尾（或反斜杠）= 硬换行，段落内部折行要保留
+    const groups = [];
+    let current = [];
+    for (let i = 0; i < paragraph.length; i += 1) {
+      const line = paragraph[i];
+      current.push(line.trim());
+      const hardBreak = / {2,}$/.test(line) || line.endsWith('\\');
+      if (hardBreak && i < paragraph.length - 1) {
+        groups.push(current);
+        current = [];
+      }
     }
+    groups.push(current);
+    html.push(`<p>${groups.map((group) => renderInline(group.join(' '))).join('<br />')}</p>`);
+    paragraph = [];
   };
-  const flushAll = () => { flushParagraph(); closeList(); };
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
@@ -92,7 +250,7 @@ export function renderMarkdown(source) {
         html.push(`<pre><code class="lang-${escapeHtml(codeLang)}">${escapeHtml(codeLines.join('\n'))}</code></pre>`);
         inCode = false; codeLines = []; codeLang = '';
       } else {
-        flushAll();
+        flushParagraph();
         inCode = true; codeLang = fence[1] || '';
       }
       continue;
@@ -100,20 +258,20 @@ export function renderMarkdown(source) {
     if (inCode) { codeLines.push(line); continue; }
 
     // ---- 空行 ----
-    if (!line.trim()) { flushAll(); continue; }
+    if (!line.trim()) { flushParagraph(); continue; }
 
     // ---- 标题 ----
     const heading = line.match(/^(#{1,6})\s+(.*)$/);
     if (heading) {
-      flushAll();
+      flushParagraph();
       const level = heading[1].length;
       html.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
       continue;
     }
 
-    // ---- 分割线 ----
-    if (/^\s*([-*_])\s*\1\s*\1[\s\-*_]*$/.test(line)) {
-      flushAll();
+    // ---- 分割线（必须先于列表判断，否则 "- - -" 会被当成列表项）----
+    if (isThematicBreak(line)) {
+      flushParagraph();
       html.push('<hr />');
       continue;
     }
@@ -121,14 +279,14 @@ export function renderMarkdown(source) {
     // ---- 引用 ----
     const quote = line.match(/^\s*>\s?(.*)$/);
     if (quote) {
-      flushAll();
+      flushParagraph();
       html.push(`<blockquote>${renderInline(quote[1])}</blockquote>`);
       continue;
     }
 
     // ---- 表格 ----
     if (line.includes('|') && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
-      flushAll();
+      flushParagraph();
       const head = splitRow(line);
       const rows = [];
       i += 2;
@@ -145,26 +303,24 @@ export function renderMarkdown(source) {
       continue;
     }
 
-    // ---- 列表 ----
-    const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
-    const ordered = line.match(/^\s*\d+[.)]\s+(.*)$/);
-    if (bullet || ordered) {
+    // ---- 列表（整块交给 parseListBlock，含嵌套与松散列表）----
+    if (matchListItem(line)) {
       flushParagraph();
-      const wanted = bullet ? 'ul' : 'ol';
-      if (listType !== wanted) { closeList(); html.push(`<${wanted}>`); listType = wanted; }
-      html.push(`<li>${renderInline((bullet || ordered)[1])}</li>`);
+      const block = parseListBlock(lines, i);
+      if (block.html) html.push(block.html);
+      i = block.next - 1;   // for 循环还会 +1
       continue;
     }
 
     // ---- 普通段落 ----
-    closeList();
-    paragraph.push(line.trim());
+    // 保留原始行：行尾两个空格是硬换行标记，trim 掉就丢了
+    paragraph.push(line);
   }
 
   if (inCode && codeLines.length) {
     html.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
   }
-  flushAll();
+  flushParagraph();
 
   return html.join('\n');
 }

@@ -17,6 +17,7 @@ import {
   getInstallStatus,
   getSetup,
   listDocuments,
+  reindexDocuments,
   resetInstall,
   startInstall,
   streamChat,
@@ -52,6 +53,7 @@ const el = {
   docCount: $('docCount'),
   docEmpty: $('docEmpty'),
   clearAllBtn: $('clearAllBtn'),
+  reindexBtn: $('reindexBtn'),
 
   topK: $('topK'),
   topKOut: $('topKOut'),
@@ -503,6 +505,38 @@ function createAssistantMessage() {
   };
 }
 
+/**
+ * 组装回答上方的元信息：模型 / 召回的片段数 / 检索策略徽标。
+ *
+ * 「全文概览」和「已放宽阈值」都必须显式告诉用户，否则他会以为
+ * 这是普通问答的结果 —— 前者换了检索策略（不看相似度，按全篇取样），
+ * 后者是阈值内没命中、程序自动放宽了标准。
+ */
+function renderMetaLine(data) {
+  const parts = [`<span>模型 ${escapeHtml(data.model || '-')}</span>`];
+
+  if (data.mode === 'overview') {
+    parts.push(
+      '<span class="tag tag--mode" title="总结类问题：不看相似度，按全篇均匀取样，'
+      + `共 ${data.chunks_total || '?'} 块中取 ${data.source_count} 块">全文概览</span>`,
+    );
+  } else if (data.source_count === 0) {
+    parts.push('<span class="tag tag--warn">未召回到相关片段</span>');
+  }
+
+  if (data.relaxed) {
+    parts.push(
+      `<span class="tag tag--warn" title="阈值 ${Number(data.score_threshold).toFixed(2)} 内一条都没命中，`
+      + `已自动放宽到 ${Number(data.effective_threshold).toFixed(2)}；最佳片段相似度 `
+      + `${Number(data.best_score).toFixed(3)}">已放宽阈值</span>`,
+    );
+  }
+
+  parts.push(`<span>召回 ${data.source_count} 段</span>`);
+  if (data.chunks_total) parts.push(`<span class="tag tag--faint">索引 ${data.chunks_total} 块</span>`);
+  return parts.join('');
+}
+
 function renderSources(node, sources, cited) {
   if (!sources.length) {
     node.sourcesBox.hidden = true;
@@ -638,8 +672,7 @@ async function submit() {
   try {
     await streamChat(payload, {
       onMeta: (data) => {
-        node.meta.innerHTML = `<span>模型 ${escapeHtml(data.model)}</span>`
-          + `<span>召回 ${data.source_count} 段</span>`;
+        node.meta.innerHTML = renderMetaLine(data);
       },
       onThinking: (data) => {
         if (!state.settings.showThinking) return;
@@ -1305,6 +1338,39 @@ function bindGlobal() {
       await Promise.all([loadDocuments(), refreshHealth()]);
     } catch (error) {
       toast(`清空失败：${error.message}`, 'err');
+    }
+  });
+
+  // 重建索引：解析/切分逻辑升级后（例如新增了 PDF 页眉过滤），
+  // 磁盘上的旧索引不会自动更新，需要按原文件重跑一遍。
+  el.reindexBtn.addEventListener('click', async () => {
+    if (!state.documents.length) { toast('知识库为空，无需重建', 'warn'); return; }
+    if (!window.confirm(
+      `确定用原始文件重建 ${state.documents.length} 个文档的索引？\n\n`
+      + '会用当前的解析与切分配置重新分块（旧分块被替换），耗时取决于文档数量与大小。',
+    )) return;
+
+    el.reindexBtn.disabled = true;
+    const original = el.reindexBtn.textContent;
+    el.reindexBtn.textContent = '重建中…';
+    try {
+      const report = await reindexDocuments();
+      const changed = report.chunks_before !== report.chunks_after
+        ? `分块 ${report.chunks_before} → ${report.chunks_after}`
+        : `分块 ${report.chunks_after} 块（未变化）`;
+      toast(`已重建 ${report.rebuilt} 个文档，${changed}`, report.failed ? 'warn' : 'ok');
+      if (report.failed) {
+        const failed = (report.details || []).filter((item) => item.status !== 'ok');
+        for (const item of failed.slice(0, 3)) {
+          console.warn('重建失败：', item.filename, item.message); // eslint-disable-line no-console
+        }
+      }
+      await Promise.all([loadDocuments(), refreshHealth()]);
+    } catch (error) {
+      toast(`重建索引失败：${error.message}`, 'err');
+    } finally {
+      el.reindexBtn.disabled = false;
+      el.reindexBtn.textContent = original;
     }
   });
 
