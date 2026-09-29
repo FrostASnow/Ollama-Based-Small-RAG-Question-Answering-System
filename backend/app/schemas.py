@@ -64,6 +64,8 @@ class SearchResponse(BaseModel):
     query: str
     results: list[SourceChunk]
     elapsed_ms: int
+    # 检索诊断：mode / effective_threshold / relaxed / best_score / candidates …
+    info: dict[str, Any] = Field(default_factory=dict)
 
 
 class ChatMessage(BaseModel):
@@ -86,6 +88,11 @@ class ChatResponse(BaseModel):
     sources: list[SourceChunk]
     model: str
     elapsed_ms: int
+    # 检索策略：qa = 按相关度取 top-k；overview = 总结类问题，按全篇均匀取样
+    mode: Literal["qa", "overview"] = "qa"
+    # 是否因为阈值内一条都没命中而自动放宽了阈值
+    relaxed: bool = False
+    best_score: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +132,11 @@ class ConfigResponse(BaseModel):
     chunk_overlap: int
     top_k: int
     score_threshold: float
+    score_window: float
+    score_floor: float
+    dedupe_ratio: float
+    summary_max_chunks: int
+    strip_boilerplate: bool
     max_upload_mb: int
     allowed_extensions: list[str]
 
@@ -134,6 +146,9 @@ class ConfigUpdate(BaseModel):
     llm_temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     top_k: int | None = Field(default=None, ge=1, le=20)
     score_threshold: float | None = Field(default=None, ge=-1.0, le=1.0)
+    score_window: float | None = Field(default=None, ge=0.0, le=1.0)
+    score_floor: float | None = Field(default=None, ge=-1.0, le=1.0)
+    summary_max_chunks: int | None = Field(default=None, ge=1, le=30)
     chunk_size: int | None = Field(default=None, ge=100, le=4000)
     chunk_overlap: int | None = Field(default=None, ge=0, le=1000)
     expose_thinking: bool | None = None

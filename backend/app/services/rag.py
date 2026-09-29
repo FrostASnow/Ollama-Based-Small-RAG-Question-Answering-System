@@ -56,11 +56,44 @@ SYSTEM_PROMPT = """你是一个严谨的文档问答助手。你必须**只依�
 2. 回答中凡引用到具体事实、数据或结论，必须在句末用方括号标注来源编号，例如 [1] 或 [1][3]。
 3. 只标注真正支撑该句子的编号，不要为了凑数而随意标注。
 4. 使用与用户提问相同的语言作答（中文提问用中文回答）。
-5. 回答要简洁、结构化；内容较多时用有序/无序列表组织。
+5. 内容较多时用列表组织：每条要点独占一行，写成「- **要点**：说明 [n]」的形式；
+   同一个要点不要重复出现，也不要连续写两遍编号。
 6. 不要复述【参考资料】的全文，要提炼并直接回答。
 
 【参考资料】
 {context}
+
+再次强调：回答里每一句涉及文档内容的话，句末都必须带上来源编号（如 [1]）；整段话都没有编号的回答不合格。
+"""
+
+# 概览 / 总结类问题专用的提示词。
+#
+# 为什么不能和普通问答共用一套提示词：概览模式喂进去的是**全篇均匀取样的片段**，
+# 而不是「最相关的几段」。这时如果还写「只回答用户问的那一点」，模型会抓住
+# 某一段细节展开，总结就退化成片段复述；同时必须显式要求合并重复内容 ——
+# 取样片段来自不同章节，会有交叉重复。
+OVERVIEW_PROMPT = """你是一个严谨的文档总结助手。【文档片段】是同一篇（或同一批）文档按阅读顺序均匀抽取的内容，用来让你把握整体。
+
+请严格按下面的格式作答，不要增减小节、不要写开场白：
+
+整体：用 2~4 句话概括文档的主题、目的与主要结论。
+要点：
+- **要点名称**：一句话说明 [n]
+- **要点名称**：一句话说明 [n]
+
+规则：
+1. 只能依据【文档片段】作答；片段里没有的内容不要写，不要补充你自己的先验知识。
+2. 每条要点末尾**必须**紧跟来源编号，写成「[3]」这样；编号只能取自【文档片段】，不要自己编号。
+   没有编号的要点不合格。
+3. 要点一律用「- 」开头，不要用「1. 2. 3.」编号；不要重复同一条要点。
+4. 片段取自文档不同位置，可能有少量重复，请合并同类内容。
+5. 如果问题里还指定了具体方面（例如「总结多任务网络的优势」），请在整体概括之后**重点回答该方面**。
+6. 使用与用户提问相同的语言作答。
+
+【文档片段】
+{context}
+
+再次强调：每条要点的末尾都必须带来源编号（如 [3]）；一个编号都没有的回答不合格。
 """
 
 NO_CONTEXT_REPLY = (
@@ -68,10 +101,40 @@ NO_CONTEXT_REPLY = (
     "当前知识库中没有检索到与该问题足够相关的片段。你可以：\n"
     "- 换一种更贴近文档原文的提问方式；\n"
     "- 在左侧上传与该问题相关的文档后再试；\n"
-    "- 或在设置中调低「相似度阈值」以提高召回。"
+    "- 或在设置中调低「相似度阈值」以提高召回（当前阈值内的片段都没能被采用）。"
 )
 
+# ---------------------------------------------------------------------------
+# 提问意图：普通问答 vs 全文概览
+# ---------------------------------------------------------------------------
+# 「总结 / 概述 / 讲了什么」问的是**整篇**，与任何一个片段都不相似。
+# 实测（data 里的 4 页中文期刊论文 + all-MiniLM-L6-v2）：
+#     「多任务网络的优势是什么」 最佳相似度 0.367
+#     「请总结这篇文档的主要内容」 0.433（但 top-6 里 3 条是页眉副本）
+#     「总结一下」              0.273  ← 只比随机噪声（0.25）高一点
+# 可见靠相似度阈值筛「总结」类问题，筛出来的往往是页眉和噪声。
+# 这类问题应该改成按全篇均匀取样，让模型看到整份文档。
+_OVERVIEW_KEYWORDS = (
+    "总结", "概述", "概括", "综述", "摘要", "主要内容", "大致内容", "讲了什么",
+    "说了什么", "说的是什么", "讲的是什么", "讲了哪些", "都讲了", "整体内容",
+    "全文", "文章结构", "结构是什么", "脉络", "提炼", "要点有哪些", "介绍一下这",
+    "介绍一下文档", "介绍一下文章", "这篇讲", "本文讲", "这篇文档", "这篇文章",
+    "summarize", "summary", "overview", "main idea", "tl;dr", "what is this about",
+)
+# 概览问题通常很短；很长的提问更可能是针对某个具体细节
+_OVERVIEW_MAX_CHARS = 60
+
 _CITATION_RE = re.compile(r"\[(\d+)\]")
+
+
+def detect_intent(question: str) -> str:
+    """判断提问意图，返回 ``"overview"`` 或 ``"qa"``。"""
+    text = (question or "").strip().lower()
+    if not text or len(text) > _OVERVIEW_MAX_CHARS:
+        return "qa"
+    if any(keyword in text for keyword in _OVERVIEW_KEYWORDS):
+        return "overview"
+    return "qa"
 
 
 class LLMUnavailableError(RuntimeError):
@@ -221,6 +284,10 @@ def _build_llm() -> Any:
         temperature=settings.llm_temperature,
         num_ctx=settings.llm_num_ctx,
         num_predict=settings.llm_num_predict,
+        # 1.5B 小模型很容易陷进「同一句话连写四遍」的退化循环，
+        # 提高重复惩罚是代价最小的缓解手段（真机实测有效）。
+        repeat_penalty=settings.llm_repeat_penalty,
+        repeat_last_n=settings.llm_repeat_last_n,
         keep_alive="10m",
         reasoning=reasoning,
     )
@@ -246,7 +313,8 @@ def reset_llm() -> None:
 # 提示词装配
 # ---------------------------------------------------------------------------
 def build_context(sources: list[SourceChunk]) -> str:
-    """拼装参考资料，并按 ``max_context_chars`` 截断。"""
+    """拼装参考资料，并按上下文预算截断。"""
+    budget = settings.context_char_budget
     blocks: list[str] = []
     used = 0
     for source in sources:
@@ -254,20 +322,30 @@ def build_context(sources: list[SourceChunk]) -> str:
         header = f"[{source.index}] 来源：{source.filename}（{location}）\n"
         body = source.content.strip()
         block = f"{header}{body}\n"
-        if used + len(block) > settings.max_context_chars and blocks:
+        if used + len(block) > budget and blocks:
             break
         blocks.append(block)
         used += len(block)
     return "\n".join(blocks)
 
 
+# 引用编号的「贴身提醒」。
+#
+# 为什么要把要求再说一遍：规则写在系统提示词里、离生成位置很远，1.5B 小模型
+# 经常直接忽略（真机实测：系统提示词里已明确要求 [n]，三次回答里 0 次标注）。
+# 放在用户消息末尾（离生成最近、且属于「用户要求」）后命中率明显提高。
+_CITATION_REMINDER = "\n\n（回答时请给涉及文档内容的话标注来源编号，例如 [1]；不要凭空编号。）"
+
+
 def build_messages(
     question: str,
     sources: list[SourceChunk],
     history: list[ChatMessage] | None = None,
+    mode: str = "qa",
 ) -> list[Any]:
+    template = OVERVIEW_PROMPT if mode == "overview" else SYSTEM_PROMPT
     context = build_context(sources)
-    messages: list[Any] = [SystemMessage(content=SYSTEM_PROMPT.format(context=context))]
+    messages: list[Any] = [SystemMessage(content=template.format(context=context))]
 
     for turn in (history or [])[-settings.max_history_turns * 2 :]:
         content = turn.content.strip()
@@ -278,7 +356,8 @@ def build_messages(
         else:
             messages.append(AIMessage(content=content))
 
-    messages.append(HumanMessage(content=question))
+    tail = _CITATION_REMINDER if sources else ""
+    messages.append(HumanMessage(content=question + tail))
     return messages
 
 
@@ -303,7 +382,20 @@ class RAGService:
         score_threshold: float | None = None,
         doc_ids: list[str] | None = None,
     ) -> list[SourceChunk]:
-        return vector_store.search(
+        sources, _info = self.retrieve_detailed(question, top_k, score_threshold, doc_ids)
+        return sources
+
+    def retrieve_detailed(
+        self,
+        question: str,
+        top_k: int | None = None,
+        score_threshold: float | None = None,
+        doc_ids: list[str] | None = None,
+    ) -> tuple[list[SourceChunk], dict[str, Any]]:
+        """按提问意图选择检索策略，并返回检索诊断信息。"""
+        if detect_intent(question) == "overview":
+            return vector_store.overview_chunks(question, doc_ids=doc_ids)
+        return vector_store.search_detailed(
             query=question,
             top_k=top_k,
             score_threshold=score_threshold,
@@ -323,7 +415,7 @@ class RAGService:
 
         # 1) 检索
         try:
-            sources = self.retrieve(question, top_k, score_threshold, doc_ids)
+            sources, info = self.retrieve_detailed(question, top_k, score_threshold, doc_ids)
         except Exception as exc:  # noqa: BLE001
             logger.exception("检索失败")
             yield {"event": "error", "data": {"message": f"检索失败：{exc}", "stage": "retrieve"}}
@@ -333,10 +425,16 @@ class RAGService:
             "event": "meta",
             "data": {
                 "model": settings.llm_model,
+                "mode": info.get("mode", "qa"),
                 "top_k": top_k or settings.top_k,
                 "score_threshold": (
                     settings.score_threshold if score_threshold is None else score_threshold
                 ),
+                "effective_threshold": info.get("effective_threshold", 0.0),
+                "best_score": info.get("best_score", 0.0),
+                "relaxed": bool(info.get("relaxed")),
+                "candidates": info.get("candidates", 0),
+                "chunks_total": info.get("chunks_total", 0),
                 "source_count": len(sources),
             },
         }
@@ -351,12 +449,14 @@ class RAGService:
                     "elapsed_ms": int((time.perf_counter() - started) * 1000),
                     "cited": [],
                     "fallback": True,
+                    "mode": info.get("mode", "qa"),
                 },
             }
             return
 
         # 3) 生成
-        messages = build_messages(question, sources, history)
+        mode = str(info.get("mode", "qa"))
+        messages = build_messages(question, sources, history, mode=mode)
         splitter = ThinkSplitter()
         answer_parts: list[str] = []
         thinking_parts: list[str] = []
@@ -455,6 +555,8 @@ class RAGService:
                 "cited": cited,
                 "answer_chars": len(answer),
                 "usage": usage,
+                "mode": mode,
+                "relaxed": bool(info.get("relaxed")),
             },
         }
 
@@ -468,7 +570,8 @@ class RAGService:
     ) -> dict[str, Any]:
         """非流式问答（供脚本 / 第三方 API 集成使用）。"""
         started = time.perf_counter()
-        sources = self.retrieve(question, top_k, score_threshold, doc_ids)
+        sources, info = self.retrieve_detailed(question, top_k, score_threshold, doc_ids)
+        mode = str(info.get("mode", "qa"))
         if not sources:
             return {
                 "answer": NO_CONTEXT_REPLY,
@@ -476,9 +579,12 @@ class RAGService:
                 "sources": [],
                 "model": settings.llm_model,
                 "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                "mode": mode,
+                "relaxed": False,
+                "best_score": info.get("best_score", 0.0),
             }
 
-        messages = build_messages(question, sources, history)
+        messages = build_messages(question, sources, history, mode=mode)
         try:
             raw = await get_llm().ainvoke(messages)
         except Exception as exc:  # noqa: BLE001
@@ -500,6 +606,9 @@ class RAGService:
             "sources": sources,
             "model": settings.llm_model,
             "elapsed_ms": int((time.perf_counter() - started) * 1000),
+            "mode": mode,
+            "relaxed": bool(info.get("relaxed")),
+            "best_score": info.get("best_score", 0.0),
         }
 
 

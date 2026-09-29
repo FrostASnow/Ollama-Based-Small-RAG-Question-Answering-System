@@ -4,9 +4,14 @@
 即使 Ollama 未启动也能跑：问答接口会走到 error 分支，本测试会断言
 「服务端返回结构化的 error 事件，而不是静默挂断或 500」。
 
-用法（需要先在另一个终端启动服务）：
-    .venv\\Scripts\\python.exe tests\\test_http.py
-    .venv\\Scripts\\python.exe tests\\test_http.py --base http://127.0.0.1:8000
+用法：
+    .\\tests\\run_all.ps1
+    .venv\\Scripts\\python.exe tests\\test_http.py --base http://127.0.0.1:8099
+
+**注意：本套件会 DELETE /api/documents（清空知识库）**，因此只允许对着
+使用临时数据目录的实例运行。`run_all.ps1` 会自动起一个这样的实例；
+如果直接对着 `scripts\\start.cmd` 启动的服务跑，测试会在第一步就拒绝执行
+（依据 /api/health 上报的 data_dir），避免误删用户上传的文档。
 """
 
 from __future__ import annotations
@@ -91,8 +96,13 @@ def main() -> int:
     # 等待服务真正就绪。
     # 在带网络代理的环境里，服务刚启动、端口尚未监听时，首个请求可能收到
     # 代理返回的 502 而不是连接错误，直接判定失败会造成误报。
+    #
+    # trust_env=False 是关键：Windows 上一旦系统设置了代理（注册表里的
+    # ProxyEnable/ProxyServer），httpx 会**连 127.0.0.1 也走代理**，于是本地
+    # 服务永远拿到 502 —— 表现为「服务未就绪」，但用浏览器/Invoke-RestMethod
+    # 又是好的（它们会读代理绕过列表，httpx 不读）。本套件只测本机服务。
     ready = False
-    with httpx.Client(base_url=base, timeout=5.0) as probe:
+    with httpx.Client(base_url=base, timeout=5.0, trust_env=False) as probe:
         for _ in range(80):
             try:
                 if probe.get("/api/health").status_code == 200:
@@ -110,7 +120,7 @@ def main() -> int:
 
     uploaded_doc_id = None
 
-    with httpx.Client(base_url=base, timeout=60.0) as client:
+    with httpx.Client(base_url=base, timeout=60.0, trust_env=False) as client:
         # ------------------------------------------------------------------
         section("1. 健康检查与配置")
         try:
@@ -122,6 +132,26 @@ def main() -> int:
 
         check("GET /api/health 返回 200", r.status_code == 200, f"HTTP {r.status_code}")
         health = r.json()
+
+        # ------------------------------------------------------------------
+        # 安全检查：本套件会 DELETE /api/documents（清空知识库）。
+        # 如果目标服务用的是真实 data/ 目录，那它删掉的是用户上传的文档 ——
+        # 数据丢失，不是「测试副作用」。发现这种情况立即停手。
+        # 正确用法：用 tests\run_all.ps1 跑，它会启动一个使用临时数据目录的实例。
+        # ------------------------------------------------------------------
+        target_data_dir = (health.get("detail") or {}).get("data_dir", "")
+        real_data_dir = PROJECT_ROOT / "data"
+        print(f"目标服务数据目录: {target_data_dir or '(未上报)'}")
+        if not target_data_dir:
+            print("\n[FAIL] 服务未上报 data_dir，无法确认它是不是临时数据目录。")
+            print("       本套件会清空知识库，拒绝在不确定的情况下继续。")
+            print("       请改用：.\\tests\\run_all.ps1")
+            return 1
+        if Path(target_data_dir).resolve() == real_data_dir.resolve():
+            print("\n[FAIL] 目标服务正在使用真实数据目录，本套件会把它清空。")
+            print(f"       {real_data_dir}")
+            print("       请改用：.\\tests\\run_all.ps1（会自动起一个临时目录实例）")
+            return 1
 
         # JSON 必须显式声明 charset=utf-8。
         # 否则 Windows PowerShell 5.1 的 Invoke-RestMethod 会按 ISO-8859-1 解码，
@@ -158,6 +188,11 @@ def main() -> int:
         check("配置含 top_k", "top_k" in config, str(config.get("top_k")))
         check("配置含嵌入模型名", "embedding_model_name" in config,
               str(config.get("embedding_model_name")))
+        check("配置暴露检索工程化参数",
+              all(key in config for key in ("score_window", "score_floor", "dedupe_ratio",
+                                            "summary_max_chunks", "strip_boilerplate")),
+              str({key: config.get(key) for key in ("score_window", "score_floor",
+                                                     "dedupe_ratio", "summary_max_chunks")}))
 
         r = client.get("/api/models")
         check("GET /api/models 返回 200", r.status_code == 200)
@@ -243,9 +278,46 @@ def main() -> int:
             check("结果含相似度分数", isinstance(top["score"], float), str(top["score"]))
             check("结果含原文片段", len(top["content"]) > 0, f"{len(top['content'])} 字符")
         check("返回耗时", isinstance(search_data["elapsed_ms"], int))
+        info = search_data.get("info") or {}
+        check("检索诊断含 mode", info.get("mode") in ("qa", "overview"), str(info.get("mode")))
+        check("检索诊断含生效阈值",
+              isinstance(info.get("effective_threshold"), (int, float)),
+              str(info.get("effective_threshold")))
+        check("检索诊断含最佳分数与去重数量",
+              isinstance(info.get("best_score"), (int, float))
+              and isinstance(info.get("dropped_duplicates"), int),
+              f"best={info.get('best_score')} dup={info.get('dropped_duplicates')}")
+        check("检索诊断含索引总量",
+              isinstance(info.get("chunks_total"), int) and info["chunks_total"] > 0,
+              str(info.get("chunks_total")))
+
+        # 总结类问题：非流式问答要声明走了概览检索
+        r = client.post("/api/search", json={"query": "总结一下这份文档的主要内容",
+                                             "score_threshold": 0.2})
+        check("POST /api/search 总结类问题仍走向量检索（纯检索接口不切策略）",
+              r.status_code == 200 and (r.json().get("info") or {}).get("mode") == "qa")
 
         # ------------------------------------------------------------------
-        section("5. 流式问答（SSE 协议）")
+        section("5. 重建索引接口")
+        r = client.post("/api/documents/reindex")
+        check("POST /api/documents/reindex 返回 200", r.status_code == 200,
+              f"HTTP {r.status_code}")
+        report = r.json()
+        check("报告重建文档数与分块数变化",
+              report.get("rebuilt", 0) >= 1 and isinstance(report.get("chunks_after"), int),
+              f"rebuilt={report.get('rebuilt')} {report.get('chunks_before')}->"
+              f"{report.get('chunks_after')}")
+        check("重建后分块数不为 0", report.get("chunks_after", 0) > 0,
+              str(report.get("chunks_after")))
+        check("重建明细逐文档返回",
+              isinstance(report.get("details"), list) and len(report["details"]) >= 1)
+        r = client.get("/api/documents")
+        check("重建后注册表与实际分块一致",
+              r.json()["total_chunks"] == report.get("chunks_after"),
+              f"{r.json()['total_chunks']} vs {report.get('chunks_after')}")
+
+        # ------------------------------------------------------------------
+        section("6. 流式问答（SSE 协议）")
         # 无论 Ollama 是否在跑，协议本身都必须成立：
         #   在跑  -> meta/token/sources/done
         #   没跑  -> meta/error
@@ -274,6 +346,34 @@ def main() -> int:
         check("meta 含模型名", bool(meta.get("model")), str(meta.get("model")))
         check("meta 报告召回数量", meta.get("source_count", 0) >= 1,
               str(meta.get("source_count")))
+        check("meta 声明检索策略 mode", meta.get("mode") in ("qa", "overview"),
+              str(meta.get("mode")))
+        check("meta 声明是否放宽阈值", isinstance(meta.get("relaxed"), bool),
+              str(meta.get("relaxed")))
+        check("meta 带上最佳相似度与索引总量",
+              isinstance(meta.get("best_score"), (int, float))
+              and isinstance(meta.get("chunks_total"), int),
+              f"best={meta.get('best_score')} total={meta.get('chunks_total')}")
+
+        # 概览类提问必须切到 overview 策略（阈值对它没有意义）
+        with client.stream(
+            "POST",
+            "/api/chat",
+            json={"question": "用三句话总结这份文档的主要内容", "stream": True},
+            headers={"Accept": "text/event-stream"},
+            timeout=120.0,
+        ) as response:
+            overview_body = "".join(response.iter_text())
+        overview_meta = next(
+            (d for n, d in parse_sse(overview_body) if n == "meta"), {}
+        )
+        check("总结类问题的 meta.mode 为 overview",
+              overview_meta.get("mode") == "overview", str(overview_meta.get("mode")))
+        overview_total = int(overview_meta.get("chunks_total") or 0)
+        overview_count = int(overview_meta.get("source_count") or 0)
+        check("概览模式覆盖全部分块（小文档）或达到取样预算（大文档）",
+              overview_count >= 1 and overview_count >= min(overview_total, 4),
+              f"{overview_count} / {overview_total} 块")
 
         if "error" in names:
             error = next(d for n, d in events if n == "error")
@@ -289,7 +389,7 @@ def main() -> int:
             print(f"        回答（前 120 字）：{answer[:120]}")
 
         # ------------------------------------------------------------------
-        section("6. 文档删除")
+        section("7. 文档删除")
         r = client.delete(f"/api/documents/{uploaded_doc_id}")
         check("DELETE 单个文档返回 200", r.status_code == 200, f"HTTP {r.status_code}")
         check("报告删除的分块数", r.json()["deleted_chunks"] > 0,
@@ -308,7 +408,7 @@ def main() -> int:
               r.json().get("detail", "")[:60])
 
         # ------------------------------------------------------------------
-        section("7. 首次配置引导（/api/setup）")
+        section("8. 首次配置引导（/api/setup）")
         r = client.get("/api/setup", timeout=30.0)
         check("GET /api/setup 返回 200", r.status_code == 200, f"HTTP {r.status_code}")
         setup = r.json()
@@ -418,7 +518,7 @@ def main() -> int:
               str(setup["environment"].get("can_auto_install")))
 
         # ------------------------------------------------------------------
-        section("8. 一键安装接口")
+        section("9. 一键安装接口")
 
         r = client.get("/api/setup/install", timeout=15.0)
         check("GET /api/setup/install 返回 200", r.status_code == 200, f"HTTP {r.status_code}")

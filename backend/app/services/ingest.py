@@ -176,6 +176,93 @@ def clear_all() -> int:
     return removed
 
 
+def reindex_all() -> dict[str, Any]:
+    """用 ``data/uploads`` 里的原文件按**当前配置**重建全部索引。
+
+    解析与切分逻辑（页眉过滤、chunk_size、切分符）改动后，磁盘上的旧索引不会
+    自动更新 —— 老问题会一直在。这里重跑一遍：先删掉该文档的旧向量，
+    再重新解析入库。embedding 模型和维度必须与旧索引一致，否则应当清空重建。
+    """
+    records = registry.all()
+    details: list[dict[str, Any]] = []
+    chunks_before = 0
+    chunks_after = 0
+    failed = 0
+
+    for record in records:
+        doc_id = str(record.get("doc_id") or "")
+        filename = str(record.get("filename") or record.get("stored_name") or doc_id)
+        stored_name = record.get("stored_name")
+        old_ids = list(record.get("faiss_ids", []))
+        chunks_before += len(old_ids)
+
+        path = UPLOADS_DIR / str(stored_name) if stored_name else None
+        if path is None or not path.is_file():
+            failed += 1
+            details.append(
+                {
+                    "doc_id": doc_id,
+                    "filename": filename,
+                    "status": "missing",
+                    "message": "原始文件已不在 data/uploads，无法重建",
+                }
+            )
+            continue
+
+        try:
+            vector_store.delete_ids(old_ids)
+            chunks, char_count = parse_document(path, doc_id, filename)
+            new_ids = vector_store.add_chunks(chunks)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("重建索引失败：%s", filename)
+            failed += 1
+            details.append(
+                {
+                    "doc_id": doc_id,
+                    "filename": filename,
+                    "status": "failed",
+                    "message": str(exc),
+                }
+            )
+            continue
+
+        chunks_after += len(new_ids)
+        updated = dict(record)
+        updated.update(
+            {
+                "chunk_count": len(new_ids),
+                "char_count": char_count,
+                "faiss_ids": new_ids,
+                "status": "indexed",
+                "error": None,
+            }
+        )
+        registry.add(updated)  # 按 doc_id 覆盖写
+        details.append(
+            {
+                "doc_id": doc_id,
+                "filename": filename,
+                "status": "ok",
+                "chunks_before": len(old_ids),
+                "chunks_after": len(new_ids),
+                "char_count": char_count,
+            }
+        )
+
+    registry.set_index_meta(settings.embedding_model_name, settings.embedding_dimension)
+    registry.save()
+    vector_store.persist()
+
+    return {
+        "documents": len(records),
+        "rebuilt": len(records) - failed,
+        "failed": failed,
+        "chunks_before": chunks_before,
+        "chunks_after": chunks_after,
+        "details": details,
+    }
+
+
 __all__ = [
     "IngestError",
     "DocumentParseError",
@@ -184,5 +271,6 @@ __all__ = [
     "ingest_path",
     "delete_document",
     "clear_all",
+    "reindex_all",
     "sanitize_filename",
 ]

@@ -31,7 +31,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 $script:Results = @()
 
 function Invoke-Suite {
-    param([string]$Name, [string]$File, [string[]]$Args = @())
+    param([string]$Name, [string]$File, [string[]]$SuiteArgs = @())
 
     Write-Host ''
     Write-Host ('=' * 74) -ForegroundColor DarkGray
@@ -39,11 +39,14 @@ function Invoke-Suite {
     Write-Host ('=' * 74) -ForegroundColor DarkGray
 
     $path = Join-Path $PSScriptRoot $File
-    & $VenvPython $path @Args
+    # 这里刻意**不再** 把输出丢给 Out-Null：
+    # 以前调用方写 `Invoke-Suite ... | Out-Null`，连子进程的 stdout 一并被吞掉，
+    # 套件失败时只剩汇总表里一个「失败」，排查时毫无线索。
+    # 参数名也不能叫 $Args —— 那是 PowerShell 的自动变量。
+    & $VenvPython $path @SuiteArgs
     $code = $LASTEXITCODE
 
     $script:Results += [pscustomobject]@{ Name = $Name; Passed = ($code -eq 0) }
-    return $code
 }
 
 if (-not (Test-Path $VenvPython)) {
@@ -300,16 +303,16 @@ if (-not (Test-Path $libPath)) {
 $script:Results += [pscustomobject]@{ Name = '预检：脚本编码与语法'; Passed = $scriptOk }
 
 # ---------------------------------------------------------------------------
-Invoke-Suite -Name '1/6 依赖导入体检' -File 'check_imports.py' | Out-Null
+Invoke-Suite -Name '1/6 依赖导入体检' -File 'check_imports.py'
 
 # ---------------------------------------------------------------------------
-Invoke-Suite -Name '2/6 离线核心链路（嵌入 + FAISS + 切分）' -File 'test_offline.py' | Out-Null
+Invoke-Suite -Name '2/6 离线核心链路（嵌入 + FAISS + 切分）' -File 'test_offline.py'
 
 # ---------------------------------------------------------------------------
-Invoke-Suite -Name '3/6 RAG 端到端（假 LLM）' -File 'test_e2e.py' | Out-Null
+Invoke-Suite -Name '3/6 RAG 端到端（假 LLM）' -File 'test_e2e.py'
 
 # ---------------------------------------------------------------------------
-Invoke-Suite -Name '4/6 Ollama 集成（协议兼容假服务）' -File 'test_ollama_integration.py' | Out-Null
+Invoke-Suite -Name '4/6 Ollama 集成（协议兼容假服务）' -File 'test_ollama_integration.py'
 
 # ---------------------------------------------------------------------------
 if ($SkipHttp) {
@@ -317,27 +320,40 @@ if ($SkipHttp) {
     Write-Host '5/6 HTTP 层验收 —— 已跳过 (-SkipHttp)' -ForegroundColor Yellow
     $script:Results += [pscustomobject]@{ Name = '5/6 HTTP 层验收'; Passed = $null }
 } else {
-    # 检查服务是否在跑，不在就临时拉起一个
+    # HTTP 验收会 DELETE /api/documents（清空知识库），所以**必须**跑在临时
+    # 数据目录上：这里总是新起一个专用实例（RAG_DATA_DIR 指向 .tmp），
+    # 绝不复用用户正在使用的服务 —— 以前复用会把用户上传的文档删光。
     $serverProcess = $null
-    $alreadyRunning = $false
-    try {
-        Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 3 | Out-Null
-        $alreadyRunning = $true
-    } catch { }
+    $testDataDir = Join-Path $PSScriptRoot '..\.tmp\http-suite-data'
+    $testDataDir = [System.IO.Path]::GetFullPath($testDataDir)
+    New-Item -ItemType Directory -Path $testDataDir -Force | Out-Null
 
-    if (-not $alreadyRunning) {
-        Write-Host ''
-        Write-Host "  后端未运行，正在临时启动（端口 $Port）..." -ForegroundColor Gray
-        $serverProcess = Start-Process -FilePath $VenvPython `
-            -ArgumentList @('-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', "$Port", '--log-level', 'warning') `
-            -WorkingDirectory $BackendDir -PassThru -WindowStyle Hidden
-
-        Start-Sleep -Seconds 2
+    # 找一个空闲端口，避免和用户正在运行的服务撞车
+    $testPort = $Port
+    for ($candidate = $Port; $candidate -lt ($Port + 30); $candidate++) {
+        $busy = $false
+        try {
+            $probe = [System.Net.Sockets.TcpClient]::new()
+            $probe.Connect('127.0.0.1', $candidate)
+            $probe.Close()
+            $busy = $true
+        } catch { }
+        if (-not $busy) { $testPort = $candidate; break }
     }
 
+    Write-Host ''
+    Write-Host "  启动专用测试后端：端口 $testPort，数据目录 .tmp\http-suite-data" -ForegroundColor Gray
+    $env:RAG_DATA_DIR = $testDataDir
+    $serverProcess = Start-Process -FilePath $VenvPython `
+        -ArgumentList @('-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', "$testPort", '--log-level', 'warning') `
+        -WorkingDirectory $BackendDir -PassThru -WindowStyle Hidden
+    Remove-Item Env:\RAG_DATA_DIR -ErrorAction SilentlyContinue
+
+    Start-Sleep -Seconds 2
+
     try {
-        Invoke-Suite -Name '5/6 HTTP 层验收（真实服务）' -File 'test_http.py' `
-            -Args @('--base', "http://127.0.0.1:$Port") | Out-Null
+        Invoke-Suite -Name '5/6 HTTP 层验收（专用临时实例）' -File 'test_http.py' `
+            -SuiteArgs @('--base', "http://127.0.0.1:$testPort")
     } finally {
         if ($serverProcess -and -not $serverProcess.HasExited) {
             Write-Host "  关闭临时后端（PID $($serverProcess.Id)）" -ForegroundColor Gray

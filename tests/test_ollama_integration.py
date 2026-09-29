@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -23,7 +24,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 TMP_ROOT = PROJECT_ROOT / ".tmp" / "tests"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
+# 本套件同样会 clear_all()，必须跑在临时数据目录上（导入 app.* 之前设置）
+os.environ["RAG_DATA_DIR"] = str(TMP_ROOT / "data_ollama")
+
 from app.config import settings  # noqa: E402
+from app.core.paths import DATA_DIR  # noqa: E402
 from app.services import ollama_client, rag  # noqa: E402
 from app.services.ingest import clear_all, ingest_path  # noqa: E402
 from tests.fake_ollama import (  # noqa: E402
@@ -77,6 +82,12 @@ async def main() -> int:
 
     server, base_url = start_fake_ollama()
     print(f"假 Ollama: {base_url}")
+
+    # 数据目录隔离自检：不通过就停手，别把真实知识库清空
+    if DATA_DIR == PROJECT_ROOT / "data":
+        print("\n[FAIL] 数据目录隔离失效：本套件会清空知识库，拒绝在真实 data/ 上运行")
+        return 1
+    print(f"数据目录（隔离）: {DATA_DIR}")
 
     # 指向假服务并清掉缓存
     settings.ollama_base_url = base_url

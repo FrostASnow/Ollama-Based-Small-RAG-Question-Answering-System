@@ -293,6 +293,134 @@ def main() -> int:
         shutil.rmtree(work_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------
+    section("5. PDF 版面还原：页眉 / 段落 / 参考文献")
+    # 真实故障（用户实机反馈「0.2 阈值下总结不出文档内容」的成因之一）：
+    # 期刊 PDF 每页都有同一段页眉，它在向量空间里是「关键词拼盘」，
+    # 对任何提问相似度都不低；参考文献列表同样如此。实测那篇 4 页论文的
+    # top-6 里 3 条是页眉副本、1 条是参考文献，正文一条都没进来。
+    from app.services.loader import (
+        insert_paragraph_breaks,
+        strip_reference_sections,
+        strip_repeated_lines,
+    )
+
+    def page(body: str) -> tuple[str, dict]:
+        return (body, {})
+
+    # 页眉在奇数页和偶数页上差一个空格 —— 只折叠空白是抓不到的
+    pages = [
+        page("2020 年第 2 期\n信息与电脑\nChina Computer & Communication人工智能与识别技术\n正文甲。"),
+        page("2020 年第 2 期\n信息与电脑\nChina Computer & Communication 人工智能与识别技术\n正文乙。"),
+        page("2020 年第 2 期\n信息与电脑\nChina Computer & Communication人工智能与识别技术\n正文丙。"),
+        page("2020 年第 2 期\n信息与电脑\nChina Computer & Communication 人工智能与识别技术\n正文丁。"),
+    ]
+    cleaned_pages, dropped_lines = strip_repeated_lines(pages)
+    check("页眉被识别为重复行（含空格差异）", dropped_lines == 12, f"删除 {dropped_lines} 行")
+    check("页眉已从正文中移除", all("China Computer" not in text for text, _ in cleaned_pages))
+    check("正文未被误删", all(text.strip().endswith("。") for text, _ in cleaned_pages),
+          str([text.strip()[-3:] for text, _ in cleaned_pages]))
+
+    short_pages, short_dropped = strip_repeated_lines(pages[:2])
+    check("页数太少时不做重复行过滤（样本不足易误删）",
+          short_dropped == 0 and short_pages == pages[:2])
+
+    flowed = "设计要点如下。\n1.1 多任务网络架构\n笔者首先将人脸检测与关键点定位相结合。"
+    repaired = insert_paragraph_breaks(flowed)
+    check("小节标题前补回段落边界", "\n\n1.1 多任务网络架构" in repaired, repaired.replace("\n", "\\n"))
+
+    switched = insert_paragraph_breaks(
+        "Key words:  multi-task network; face detection\n中文正文开始，这里讲具体做法。"
+    )
+    check("中英文切换处补回段落边界",
+          "face detection\n\n中文正文开始" in switched, switched.replace("\n", "\\n"))
+
+    plain_flowed = insert_paragraph_breaks("这是一句普通的话。\n紧接着还是同一段。")
+    check("同一段内的普通换行不插空行", "\n\n" not in plain_flowed)
+
+    ref_pages = [
+        page(
+            "结语：本文提出了多任务网络。\n参考文献\n"
+            "[1] 张三 . 论文题目 [D]. 北京 : 某大学 ,2019:1-2.\n"
+            "[2] 李四 . 另一篇论文 [J]. 某期刊 ,2020:3-4."
+        )
+    ]
+    cut_pages, cut_lines = strip_reference_sections(ref_pages)
+    check("参考文献列表被截掉", cut_lines > 0 and "参考文献" not in cut_pages[0][0],
+          f"截掉 {cut_lines} 行")
+    check("参考文献之前的正文保留", "结语" in cut_pages[0][0])
+
+    mention_pages = [page("正文里顺口提到参考文献的排版习惯。\n后面还有正文内容。")]
+    kept_pages, kept_lines = strip_reference_sections(mention_pages)
+    check("只是提到「参考文献」不会被误删",
+          kept_lines == 0 and "后面还有正文内容" in kept_pages[0][0])
+
+    # ------------------------------------------------------------------
+    section("6. 提问意图识别与提示词切换")
+    from app.schemas import SourceChunk
+    from app.services.rag import OVERVIEW_PROMPT, SYSTEM_PROMPT, build_messages, detect_intent
+
+    for question in (
+        "请总结这篇文档的主要内容",
+        "总结一下",
+        "文档的大致内容",
+        "用三句话总结这些文档的主要内容",
+        "这篇文章讲了什么？",
+    ):
+        check(f"概览意图：{question}", detect_intent(question) == "overview")
+
+    for question in ("多任务网络的优势是什么", "住宿费每晚多少钱", "年假有几天"):
+        check(f"问答意图：{question}", detect_intent(question) == "qa")
+
+    # 很长的提问更可能是针对某个细节，不该被当成概览
+    long_question = "请总结" + "关于差旅报销与休假制度的各项具体规定以及需要留意的例外情形和审批要求" * 4
+    check("超长提问不判为概览", detect_intent(long_question) == "qa",
+          f"{len(long_question)} 字")
+
+    demo_sources = [
+        SourceChunk(index=1, doc_id="d1", filename="a.txt", page=1,
+                    chunk_index=0, score=0.5, content="示例内容。")
+    ]
+    overview_system = build_messages("总结一下", demo_sources, [], mode="overview")[0].content
+    qa_system = build_messages("总结一下", demo_sources, [], mode="qa")[0].content
+    check("概览模式换成概览提示词", overview_system.startswith(OVERVIEW_PROMPT[:12]))
+    check("问答模式仍用问答提示词", qa_system.startswith(SYSTEM_PROMPT[:12]))
+    check("两种提示词都带参考资料占位", "示例内容" in overview_system and "示例内容" in qa_system)
+
+    # ------------------------------------------------------------------
+    section("7. 近重复去重与概览取样名额")
+    from langchain_core.documents import Document
+
+    from app.services.vectorstore import (
+        _allocate_quotas,
+        _dedupe_pairs,
+        _evenly_pick,
+        _jaccard,
+        _shingles,
+    )
+
+    header = "2020 年第 2 期 信息与电脑 China Computer & Communication 人工智能与识别技术 "
+    duplicate_pairs = [
+        (Document(page_content=header + "正文甲：住宿费一线城市每晚 600 元。"), 0.61),
+        (Document(page_content=header + "正文甲：住宿费一线城市每晚 600 元。"), 0.60),
+        (Document(page_content="年假满一年 5 天，满三年 10 天。"), 0.35),
+    ]
+    kept_pairs, dropped_pairs = _dedupe_pairs(duplicate_pairs, 0.8)
+    check("页眉副本只保留一条", dropped_pairs == 1 and len(kept_pairs) == 2,
+          f"保留 {len(kept_pairs)} / 丢弃 {dropped_pairs}")
+    check("保留的是分数更高的那条", kept_pairs[0][1] == 0.61)
+    check("内容不同不会被误判为重复",
+          _jaccard(_shingles("差旅报销标准"), _shingles("年假天数规定")) < 0.2)
+
+    quotas = _allocate_quotas([11, 131], 10)
+    check("长短文档都能分到名额", all(value >= 1 for value in quotas), str(quotas))
+    check("名额总数不超过预算", sum(quotas) <= 10, str(quotas))
+    check("长文档分到更多名额", quotas[1] > quotas[0], str(quotas))
+
+    picked = _evenly_pick([(index, None) for index in range(20)], 4)
+    check("均匀取样首尾必取", [item[0] for item in picked][0] == 0
+          and [item[0] for item in picked][-1] == 19, str([item[0] for item in picked]))
+
+    # ------------------------------------------------------------------
     print()
     print("=" * 70)
     print(f"结果：通过 {PASSED} 项，失败 {FAILED} 项")

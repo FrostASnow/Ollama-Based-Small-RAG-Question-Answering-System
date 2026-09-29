@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
+from app.core.paths import DATA_DIR
 from app.schemas import (
     ConfigResponse,
     ConfigUpdate,
@@ -73,6 +74,9 @@ async def health() -> HealthResponse:
             "ollama_install": portable,
             "vector_store": vector_store.stats(),
             "index_meta": registry.get_index_meta(),
+            # 当前实例实际使用的数据目录。测试据此确认自己面对的是
+            # 临时目录而不是用户真实知识库（HTTP 验收会清空知识库）。
+            "data_dir": str(DATA_DIR),
         },
     )
 
@@ -153,6 +157,11 @@ async def get_config() -> ConfigResponse:
         chunk_overlap=settings.chunk_overlap,
         top_k=settings.top_k,
         score_threshold=settings.score_threshold,
+        score_window=settings.score_window,
+        score_floor=settings.score_floor,
+        dedupe_ratio=settings.dedupe_ratio,
+        summary_max_chunks=settings.summary_max_chunks,
+        strip_boilerplate=settings.strip_boilerplate,
         max_upload_mb=settings.max_upload_mb,
         allowed_extensions=settings.allowed_extensions,
     )
@@ -179,6 +188,12 @@ async def update_config(payload: ConfigUpdate) -> ConfigResponse:
         settings.top_k = payload.top_k
     if payload.score_threshold is not None:
         settings.score_threshold = payload.score_threshold
+    if payload.score_window is not None:
+        settings.score_window = payload.score_window
+    if payload.score_floor is not None:
+        settings.score_floor = payload.score_floor
+    if payload.summary_max_chunks is not None:
+        settings.summary_max_chunks = payload.summary_max_chunks
     if payload.chunk_size is not None:
         settings.chunk_size = payload.chunk_size
     if payload.chunk_overlap is not None:

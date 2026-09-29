@@ -55,6 +55,9 @@ async def chat(payload: ChatRequest):
             sources=result["sources"],
             model=result["model"],
             elapsed_ms=result["elapsed_ms"],
+            mode=result.get("mode", "qa"),
+            relaxed=bool(result.get("relaxed")),
+            best_score=float(result.get("best_score") or 0.0),
         )
 
     async def factory():
@@ -76,9 +79,13 @@ async def chat(payload: ChatRequest):
 
 @router.post("/search", response_model=SearchResponse)
 async def search(payload: SearchRequest) -> SearchResponse:
-    """纯检索接口：只返回相关片段，不调用 LLM（便于调参与排错）。"""
+    """纯检索接口：只返回相关片段，不调用 LLM（便于调参与排错）。
+
+    返回体里的 ``info`` 会带上这一轮检索的实际生效阈值、是否放宽、最佳分数等，
+    方便解释「为什么这条没被召回」。
+    """
     started = time.perf_counter()
-    results = vector_store.search(
+    results, info = vector_store.search_detailed(
         query=payload.query,
         top_k=payload.top_k,
         score_threshold=payload.score_threshold,
@@ -87,4 +94,5 @@ async def search(payload: SearchRequest) -> SearchResponse:
         query=payload.query,
         results=results,
         elapsed_ms=int((time.perf_counter() - started) * 1000),
+        info=info,
     )

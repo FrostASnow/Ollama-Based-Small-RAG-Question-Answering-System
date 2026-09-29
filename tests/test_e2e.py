@@ -34,10 +34,17 @@ sys.path.insert(0, str(BACKEND_DIR))
 TMP_ROOT = PROJECT_ROOT / ".tmp" / "tests"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
+# 关键：本套件会 clear_all()，必须让它跑在临时数据目录上。
+# 否则一次测试就会把用户上传的文档和索引全部删掉。
+# 必须在导入 app.* 之前设置 —— 路径在 app.core.paths 导入时就固定了。
+os.environ["RAG_DATA_DIR"] = str(TMP_ROOT / "data_e2e")
+
 from app.config import Settings, settings  # noqa: E402
 from app.core import browser  # noqa: E402
+from app.core.paths import DATA_DIR, UPLOADS_DIR  # noqa: E402
 from app.services import rag  # noqa: E402
-from app.services.ingest import clear_all, ingest_path  # noqa: E402
+from app.services import vectorstore as vector_store_module  # noqa: E402
+from app.services.ingest import clear_all, ingest_path, reindex_all  # noqa: E402
 from app.services.registry import registry  # noqa: E402
 from app.services.vectorstore import vector_store  # noqa: E402
 
@@ -327,7 +334,9 @@ CORPUS = [
 
 
 def prepare_corpus() -> list:
-    work = TMP_ROOT / "e2e_corpus"
+    # 语料直接落在 UPLOADS_DIR 里：既贴近真实上传路径，也让「重建索引」
+    # （按原文件重跑解析）有文件可用。本套件的 UPLOADS_DIR 是隔离的临时目录。
+    work = UPLOADS_DIR
     work.mkdir(parents=True, exist_ok=True)
 
     infos = []
@@ -344,6 +353,12 @@ async def main() -> int:
     print("=" * 70)
     print("端到端集成测试（RAG 核心，使用假 LLM）")
     print("=" * 70)
+
+    # 数据目录隔离自检：不通过就立刻停手，绝不碰真实知识库
+    if DATA_DIR == PROJECT_ROOT / "data":
+        print("\n[FAIL] 数据目录隔离失效：本套件会清空知识库，拒绝在真实 data/ 上运行")
+        return 1
+    print(f"数据目录（隔离）: {DATA_DIR}")
 
     # 保证从干净状态开始
     clear_all()
@@ -364,7 +379,7 @@ async def main() -> int:
         check("注册表统计一致", registry.stats()["chunk_count"] == total_chunks)
 
         # 重复上传同一内容应被识别
-        work = TMP_ROOT / "e2e_corpus"
+        work = UPLOADS_DIR
         dup_path = work / "travel_again.txt"
         dup_path.write_text((CORPUS[0][1] + "\n\n") * 3, encoding="utf-8")
         _, duplicated = ingest_path(dup_path, "travel_again.txt", dup_path.stat().st_size)
@@ -489,7 +504,150 @@ async def main() -> int:
               events3[-1]["data"].get("fallback") is True)
 
         # ------------------------------------------------------------------
-        section("6. 索引持久化与重载")
+        section("6. 概览检索、阈值兜底与近重复去重")
+        # 用户实机反馈：「0.2 的相似度阈值下无法对文档的大致内容进行总结」。
+        # 根因：总结类提问问的是**整篇**，与任何单个片段都不相似
+        # （实测中文短问句「总结一下」最佳相似度 0.273，与随机噪声 0.25
+        # 几乎不可分），靠阈值筛必然漏。本节把新策略钉死：
+        #   * 概览类问题 → 忽略阈值，按全篇均匀取样，并换用概览提示词
+        #   * 阈值内无命中 → 自动放宽并标记 relaxed（界面据此给出提示）
+        #   * 近重复片段只留分数最高的一条，避免页眉副本占满召回槽位
+        from app.services.rag import detect_intent
+
+        check("「用三句话总结这些文档的主要内容」→ 概览意图",
+              detect_intent("用三句话总结这些文档的主要内容") == "overview")
+        check("「总结一下」→ 概览意图", detect_intent("总结一下") == "overview")
+        check("具体问题仍然是问答意图",
+              detect_intent("一线城市住宿费每晚多少钱") == "qa")
+
+        overview_sources, overview_info = vector_store.overview_chunks(
+            "总结这些文档的主要内容", doc_ids=None, limit=8
+        )
+        check("概览模式有召回", len(overview_sources) >= 4, f"{len(overview_sources)} 段")
+        check("概览模式标记 mode=overview", overview_info.get("mode") == "overview")
+        check("概览模式不做阈值过滤",
+              overview_info.get("effective_threshold") == 0.0,
+              str(overview_info.get("effective_threshold")))
+        overview_names = {item.filename for item in overview_sources}
+        check("多文档概览覆盖到每一篇文档", len(overview_names) >= 2,
+              " / ".join(sorted(overview_names)))
+        check("概览取样带来源编号与页码",
+              all(item.index >= 1 and item.filename for item in overview_sources))
+        check("概览取样按文档分配名额（不是全给长文档）",
+              all(value >= 1 for value in (overview_info.get("quotas") or {}).values()),
+              str(overview_info.get("quotas")))
+
+        # 概览问题必须换用概览提示词，否则模型会只抓一个片段复述
+        overview_prompt = rag.build_messages("总结一下", overview_sources, [], mode="overview")
+        check("概览模式使用概览提示词",
+              "文档片段" in overview_prompt[0].content
+              and "整体" in overview_prompt[0].content)
+        check("概览提示词要求用无序列表（避免编号错乱）",
+              "- **要点名称**" in overview_prompt[0].content)
+        qa_prompt = rag.build_messages("住宿费多少", overview_sources, [], mode="qa")
+        check("问答模式仍使用问答提示词", "参考资料" in qa_prompt[0].content)
+
+        # 流式链路：meta 事件要把 mode / relaxed 带给前端
+        fake_overview = FakeLLM(["文档整体讲了两件事 [1]。"])
+        original_get_llm = rag.get_llm
+        rag.get_llm = lambda: fake_overview  # type: ignore[assignment]
+        try:
+            events_overview = [
+                e async for e in rag.rag_service.stream("总结一下这些文档的主要内容", top_k=2)
+            ]
+        finally:
+            rag.get_llm = original_get_llm  # type: ignore[assignment]
+        meta_overview = next(e for e in events_overview if e["event"] == "meta")["data"]
+        check("meta 事件声明 mode=overview", meta_overview.get("mode") == "overview")
+        check("概览模式召回数量不受 top_k 限制",
+              meta_overview.get("source_count", 0) > 2,
+              f"top_k=2 实召回 {meta_overview.get('source_count')} 段")
+        check("概览模式 meta 带 chunks_total",
+              isinstance(meta_overview.get("chunks_total"), int)
+              and meta_overview["chunks_total"] > 0)
+
+        # 阈值兜底：阈值内一条都没有时，宁可给「低置信度答案 + 标记」，
+        # 也不要直接回「无法回答」（这正是用户抱怨的场景）
+        probe_question = "量子色动力学的渐近自由如何证明"
+        _all_hits, baseline_info = vector_store.search_detailed(
+            probe_question, top_k=3, score_threshold=0.0
+        )
+        best_score = float(baseline_info.get("best_score") or 0.0)
+        # 本语料只有两篇、主题集中，任何中文提问的最佳相似度都在 0.4 上下，
+        # 已经高于默认的放宽上限（0.35）。为了验证「放宽」这条机制本身，
+        # 这里临时把上限抬到最佳分之上；上限语义另行断言（0.99 不放宽）。
+        saved_limit = settings.score_relax_limit
+        settings.score_relax_limit = min(0.99, round(best_score + 0.05, 4))
+        try:
+            strict = round(best_score + 0.02, 4)
+            relaxed_sources, relaxed_info = vector_store.search_detailed(
+                probe_question, top_k=3, score_threshold=strict
+            )
+            check("严格阈值下自动放宽而不是空手而归",
+                  len(relaxed_sources) >= 1,
+                  f"阈值 {strict} / 最佳 {best_score}")
+            check("放宽被标记出来", relaxed_info.get("relaxed") is True)
+            check("放宽后的生效阈值低于用户设定值",
+                  relaxed_info.get("effective_threshold", 1.0) < strict,
+                  f"{relaxed_info.get('effective_threshold')} < {strict}")
+        finally:
+            settings.score_relax_limit = saved_limit
+
+        extreme_sources, extreme_info = vector_store.search_detailed(
+            probe_question, top_k=3, score_threshold=0.99
+        )
+        check("阈值高到 0.99 时不擅自放宽",
+              not extreme_sources and extreme_info.get("relaxed") is False)
+
+        # 相对窗口：只保留与最佳片段相差不超过 score_window 的候选
+        wide_sources, wide_info = vector_store.search_detailed(
+            "一线城市住宿费每晚 600 元", top_k=6, score_threshold=0.0
+        )
+        windowed_sources, windowed_info = vector_store.search_detailed(
+            "一线城市住宿费每晚 600 元", top_k=6
+        )
+        if len(wide_sources) > 1:
+            floor = wide_info["best_score"] - settings.score_window - 0.001
+            check("相对窗口裁掉了远低于最佳的片段",
+                  all(item.score >= floor for item in windowed_sources),
+                  f"窗口下界 {floor:.3f}，实际最低 "
+                  f"{min((item.score for item in windowed_sources), default=0):.3f}")
+            check("阈值设 0 时不做窗口裁剪（调用方明确要求不过滤）",
+                  len(wide_sources) >= len(windowed_sources),
+                  f"{len(wide_sources)} vs {len(windowed_sources)}")
+        else:
+            check("相对窗口场景可构造", False, f"命中过少：{len(wide_sources)}")
+
+        # 近重复去重：同一段文本被重复切进多个 chunk 时只保留分数最高的一条
+        from langchain_core.documents import Document
+
+        duplicated = [
+            (Document(page_content="页眉样板文本 " + "住宿费一线城市每晚 600 元。" * 8), 0.61),
+            (Document(page_content="页眉样板文本 " + "住宿费一线城市每晚 600 元。" * 8), 0.60),
+            (Document(page_content="年假满一年 5 天，满三年 10 天，满五年 15 天。"), 0.30),
+        ]
+        kept_pairs, dropped_pairs = vector_store_module._dedupe_pairs(duplicated, 0.8)
+        check("近乎相同的片段只保留一条", dropped_pairs == 1 and len(kept_pairs) == 2,
+              f"保留 {len(kept_pairs)} / 丢弃 {dropped_pairs}")
+        check("保留的是分数更高的那条", kept_pairs[0][1] == 0.61)
+        check("检索结果里会报告去重数量",
+              "dropped_duplicates" in windowed_info,
+              str(windowed_info.get("dropped_duplicates")))
+
+        # 重建索引：解析/切分逻辑升级后，旧索引必须能按原文件重跑
+        before_chunks = registry.stats()["chunk_count"]
+        report = reindex_all()
+        check("重建覆盖所有文档", report["rebuilt"] == len(infos) and report["failed"] == 0,
+              f"重建 {report['rebuilt']} / 失败 {report['failed']}")
+        check("重建后向量数与注册表一致",
+              vector_store.size == registry.stats()["chunk_count"],
+              f"faiss={vector_store.size} registry={registry.stats()['chunk_count']}")
+        check("重建后分块数不变（TXT 解析逻辑未变）",
+              report["chunks_after"] == before_chunks,
+              f"{before_chunks} -> {report['chunks_after']}")
+
+        # ------------------------------------------------------------------
+        section("7. 索引持久化与重载")
         vector_store.persist()
         vector_store._store = None  # 模拟进程重启
         reloaded = vector_store.load(force=True)
@@ -501,7 +659,7 @@ async def main() -> int:
               results_after[0].filename if results_after else "无")
 
         # ------------------------------------------------------------------
-        section("7. 文档删除")
+        section("8. 文档删除")
         removed = vector_store.delete_ids(
             [c["faiss_id"] for c in vector_store.chunks_of(travel_id, limit=999)]
         )
@@ -510,7 +668,7 @@ async def main() -> int:
               f"{vector_store.size}")
 
         # ------------------------------------------------------------------
-        section("8. 安装日志分段解析")
+        section("9. 安装日志分段解析")
         # 纯函数，直接断言：进度行（\r 结尾）与普通行（\n 结尾）必须区分开，
         # 否则一次 1.4GB 下载能刷出上千行 "0 0 0 0 0"，把真正的错误冲出视野。
         from app.services.installer import Installer
@@ -540,7 +698,7 @@ async def main() -> int:
               throttled[-1]["text"] if throttled else "空")
 
         # ------------------------------------------------------------------
-        section("9. 冷启动与自动打开浏览器")
+        section("10. 冷启动与自动打开浏览器")
         # 用户实测现象：双击启动后浏览器先显示「127.0.0.1 拒绝连接」，
         # 几秒后才正常。原因是脚本按固定延时开浏览器，而后端冷启动要 9 秒。
         # 这里把两个根因都钉死：导入链必须轻，开浏览器的时机必须由实际探测定。
@@ -548,11 +706,11 @@ async def main() -> int:
         await _check_browser_open()
 
         # ------------------------------------------------------------------
-        section("10. Ollama 安装完整性检测")
+        section("11. Ollama 安装完整性检测")
         _check_ollama_payload()
 
         # ------------------------------------------------------------------
-        section("11. 原生 thinking 通道（reasoning_content）")
+        section("12. 原生 thinking 通道（reasoning_content）")
         # Ollama 的原生 thinking 通道下，思维链不在 content 里，而是由
         # langchain-ollama 放进 additional_kwargs["reasoning_content"]。
         # 只认 additional_kwargs["thinking"] 的话，这些内容会被静默丢弃：

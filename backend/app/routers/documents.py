@@ -11,7 +11,14 @@ from app.schemas import (
     DocumentListResponse,
     UploadResponse,
 )
-from app.services.ingest import IngestError, clear_all, delete_document, ingest_path, save_upload
+from app.services.ingest import (
+    IngestError,
+    clear_all,
+    delete_document,
+    ingest_path,
+    reindex_all,
+    save_upload,
+)
 from app.services.loader import DocumentParseError, UnsupportedFileTypeError
 from app.services.registry import registry
 from app.services.vectorstore import vector_store
@@ -119,6 +126,26 @@ async def document_chunks(doc_id: str, limit: int = 50) -> dict[str, object]:
         "returned": len(chunks),
         "chunks": chunks,
     }
+
+
+@router.post("/reindex")
+def reindex_documents() -> dict[str, object]:
+    """按当前的解析 / 切分 / 页眉过滤配置，用原文件重建整个索引。
+
+    同步函数：解析 + 向量化是 CPU 密集的阻塞操作，交给 FastAPI 的线程池执行，
+    避免卡住事件循环（否则重建期间前端连健康检查都拿不到响应）。
+    """
+    if not registry.all():
+        raise HTTPException(status_code=409, detail="知识库为空，无需重建")
+    report = reindex_all()
+    logger.info(
+        "重建索引完成：%s 个文档 / %s 块 -> %s 块（失败 %s）",
+        report["documents"],
+        report["chunks_before"],
+        report["chunks_after"],
+        report["failed"],
+    )
+    return report
 
 
 @router.delete("/{doc_id}", response_model=DeleteResponse)

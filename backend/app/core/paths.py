@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # core/paths.py -> core -> app -> backend -> rag-qa
@@ -17,7 +18,22 @@ SCRIPTS_DIR: Path = PROJECT_ROOT / "scripts"
 DOCS_DIR: Path = PROJECT_ROOT / "docs"
 TESTS_DIR: Path = PROJECT_ROOT / "tests"
 
-DATA_DIR: Path = PROJECT_ROOT / "data"
+
+def _resolve_data_dir() -> Path:
+    """数据根目录，可用环境变量 ``RAG_DATA_DIR`` 覆盖。
+
+    为什么需要这个开关：测试里有几处会「清空知识库」（``clear_all``、
+    ``DELETE /api/documents``），如果它们指向真实的 ``data/``，
+    跑一次测试就会把用户上传的文档连索引一起删掉 —— 这是数据丢失，
+    不是「测试副作用」。测试改用临时数据目录，真实知识库不受影响。
+    """
+    override = os.environ.get("RAG_DATA_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return PROJECT_ROOT / "data"
+
+
+DATA_DIR: Path = _resolve_data_dir()
 UPLOADS_DIR: Path = DATA_DIR / "uploads"
 INDEX_DIR: Path = DATA_DIR / "index"
 LOGS_DIR: Path = DATA_DIR / "logs"
