@@ -27,12 +27,20 @@ $ps1Files = @(
     'scripts\start.ps1',
     'scripts\stop.ps1',
     'scripts\fix-encoding.ps1',
+    'scripts\build-launcher.ps1',
     'scripts\lib\ollama-runtime.ps1',
-    'tests\run_all.ps1'
+    'tests\run_all.ps1',
+    'tests\test_launcher.ps1'
+)
+# .cs 同样需要 BOM：csc.exe 靠 BOM 判断源文件编码，
+# 没有 BOM 时会按系统 ANSI(936) 解析，中文界面文字全变乱码。
+$csFiles = @(
+    'launcher\RagQaLauncher.cs'
 )
 $cmdFiles = @(
     'scripts\prepare.cmd',
-    'scripts\start.cmd'
+    'scripts\start.cmd',
+    'scripts\build-launcher.cmd'
 )
 
 $utf8Bom = [System.Text.UTF8Encoding]::new($true)
@@ -40,8 +48,8 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $changed = 0
 $problems = 0
 
-Write-Host '=== .ps1 需要 UTF-8 BOM ===' -ForegroundColor Cyan
-foreach ($rel in $ps1Files) {
+Write-Host '=== .ps1 / .cs 需要 UTF-8 BOM ===' -ForegroundColor Cyan
+foreach ($rel in ($ps1Files + $csFiles)) {
     $path = Join-Path $ProjectRoot $rel
     if (-not (Test-Path $path)) { Write-Host "  [skip] $rel（不存在）"; continue }
 
