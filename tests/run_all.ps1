@@ -81,7 +81,7 @@ Write-Host ('=' * 74) -ForegroundColor DarkGray
 
 $scriptOk = $true
 
-foreach ($rel in @('scripts\prepare.ps1', 'scripts\start.ps1', 'scripts\stop.ps1', 'scripts\lib\ollama-runtime.ps1', 'tests\run_all.ps1')) {
+foreach ($rel in @('scripts\prepare.ps1', 'scripts\start.ps1', 'scripts\stop.ps1', 'scripts\fix-encoding.ps1', 'scripts\build-launcher.ps1', 'scripts\lib\ollama-runtime.ps1', 'tests\run_all.ps1', 'tests\test_launcher.ps1', 'launcher\RagQaLauncher.cs')) {
     $path = Join-Path $ProjectRoot $rel
     $bytes = [System.IO.File]::ReadAllBytes($path)
 
@@ -94,16 +94,20 @@ foreach ($rel in @('scripts\prepare.ps1', 'scripts\start.ps1', 'scripts\stop.ps1
     }
 
     $parseErrors = $null
-    [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$parseErrors) | Out-Null
-    if ($parseErrors.Count -eq 0) {
-        Write-Host "  [PASS] $rel 语法正确" -ForegroundColor Green
-    } else {
-        Write-Host "  [FAIL] $rel 语法错误：$($parseErrors[0].Message)" -ForegroundColor Red
-        $scriptOk = $false
+    # 只对 .ps1 做 PowerShell 语法检查：.cs 只是借用同一套 BOM 规则
+    # （csc.exe 也靠 BOM 识别源文件编码），拿 PowerShell 解析器去读它必然误报。
+    if ($rel -like '*.ps1') {
+        [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$parseErrors) | Out-Null
+        if ($parseErrors.Count -eq 0) {
+            Write-Host "  [PASS] $rel 语法正确" -ForegroundColor Green
+        } else {
+            Write-Host "  [FAIL] $rel 语法错误：$($parseErrors[0].Message)" -ForegroundColor Red
+            $scriptOk = $false
+        }
     }
 }
 
-foreach ($rel in @('scripts\start.cmd', 'scripts\prepare.cmd')) {
+foreach ($rel in @('scripts\start.cmd', 'scripts\prepare.cmd', 'scripts\build-launcher.cmd')) {
     $bytes = [System.IO.File]::ReadAllBytes((Join-Path $ProjectRoot $rel))
     $nonAscii = @($bytes | Where-Object { $_ -gt 127 }).Count
     if ($nonAscii -eq 0) {
@@ -303,22 +307,22 @@ if (-not (Test-Path $libPath)) {
 $script:Results += [pscustomobject]@{ Name = '预检：脚本编码与语法'; Passed = $scriptOk }
 
 # ---------------------------------------------------------------------------
-Invoke-Suite -Name '1/6 依赖导入体检' -File 'check_imports.py'
+Invoke-Suite -Name '1/7 依赖导入体检' -File 'check_imports.py'
 
 # ---------------------------------------------------------------------------
-Invoke-Suite -Name '2/6 离线核心链路（嵌入 + FAISS + 切分）' -File 'test_offline.py'
+Invoke-Suite -Name '2/7 离线核心链路（嵌入 + FAISS + 切分）' -File 'test_offline.py'
 
 # ---------------------------------------------------------------------------
-Invoke-Suite -Name '3/6 RAG 端到端（假 LLM）' -File 'test_e2e.py'
+Invoke-Suite -Name '3/7 RAG 端到端（假 LLM）' -File 'test_e2e.py'
 
 # ---------------------------------------------------------------------------
-Invoke-Suite -Name '4/6 Ollama 集成（协议兼容假服务）' -File 'test_ollama_integration.py'
+Invoke-Suite -Name '4/7 Ollama 集成（协议兼容假服务）' -File 'test_ollama_integration.py'
 
 # ---------------------------------------------------------------------------
 if ($SkipHttp) {
     Write-Host ''
-    Write-Host '5/6 HTTP 层验收 —— 已跳过 (-SkipHttp)' -ForegroundColor Yellow
-    $script:Results += [pscustomobject]@{ Name = '5/6 HTTP 层验收'; Passed = $null }
+    Write-Host '5/7 HTTP 层验收 —— 已跳过 (-SkipHttp)' -ForegroundColor Yellow
+    $script:Results += [pscustomobject]@{ Name = '5/7 HTTP 层验收'; Passed = $null }
 } else {
     # HTTP 验收会 DELETE /api/documents（清空知识库），所以**必须**跑在临时
     # 数据目录上：这里总是新起一个专用实例（RAG_DATA_DIR 指向 .tmp），
@@ -352,7 +356,7 @@ if ($SkipHttp) {
     Start-Sleep -Seconds 2
 
     try {
-        Invoke-Suite -Name '5/6 HTTP 层验收（专用临时实例）' -File 'test_http.py' `
+        Invoke-Suite -Name '5/7 HTTP 层验收（专用临时实例）' -File 'test_http.py' `
             -SuiteArgs @('--base', "http://127.0.0.1:$testPort")
     } finally {
         if ($serverProcess -and -not $serverProcess.HasExited) {
@@ -367,19 +371,34 @@ if ($SkipHttp) {
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) {
     Write-Host ''
-    Write-Host '6/6 前端测试 —— 已跳过（未找到 node）' -ForegroundColor Yellow
-    $script:Results += [pscustomobject]@{ Name = '6/6 前端测试'; Passed = $null }
+    Write-Host '6/7 前端测试 —— 已跳过（未找到 node）' -ForegroundColor Yellow
+    $script:Results += [pscustomobject]@{ Name = '6/7 前端测试'; Passed = $null }
 } else {
     Write-Host ''
     Write-Host ('=' * 74) -ForegroundColor DarkGray
-    Write-Host '  6/6 前端测试（渲染 + 静态一致性）' -ForegroundColor Cyan
+    Write-Host '  6/7 前端测试（渲染 + 静态一致性）' -ForegroundColor Cyan
     Write-Host ('=' * 74) -ForegroundColor DarkGray
 
     & node (Join-Path $PSScriptRoot 'test_frontend.mjs')
     $script:Results += [pscustomobject]@{
-        Name   = '6/6 前端测试'
+        Name   = '6/7 前端测试'
         Passed = ($LASTEXITCODE -eq 0)
     }
+}
+
+# ---------------------------------------------------------------------------
+# 一体化启动器：用户双击的那个 RAG-QA.exe。
+# 它坏了主程序测试全绿也发现不了（用户连界面都进不去），所以单独验收：
+# 编译产物新鲜度、--status 自检、GUI 窗口是否建得出来、--start/--stop 闭环。
+Write-Host ''
+Write-Host ('=' * 74) -ForegroundColor DarkGray
+Write-Host '  7/7 一体化启动器（RAG-QA.exe）' -ForegroundColor Cyan
+Write-Host ('=' * 74) -ForegroundColor DarkGray
+
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_launcher.ps1')
+$script:Results += [pscustomobject]@{
+    Name   = '7/7 一体化启动器'
+    Passed = ($LASTEXITCODE -eq 0)
 }
 
 # ---------------------------------------------------------------------------

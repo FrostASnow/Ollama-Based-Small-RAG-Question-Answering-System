@@ -28,6 +28,7 @@
 ```
 rag-qa/
 ├── README.md                   本文件
+├── RAG-QA.exe                  一体化启动器（图形面板；双击启动/关闭）
 ├── .env.example                配置模板（复制成 .env 生效）
 ├── backend/
 │   ├── requirements.txt
@@ -36,33 +37,37 @@ rag-qa/
 │       ├── config.py           配置与离线环境变量引导
 │       ├── schemas.py          请求/响应模型
 │       ├── core/
-│       │   ├── paths.py        项目路径解析
+│       │   ├── paths.py        项目路径解析（支持 RAG_DATA_DIR 覆盖）
 │       │   ├── logging.py      日志
 │       │   └── sse.py          SSE 流式封装（带心跳）
 │       ├── services/
 │       │   ├── embeddings.py   all-MiniLM-L6-v2 本地加载
-│       │   ├── loader.py       文档解析与中文友好切分
+│       │   ├── loader.py       文档解析（PDF 版面还原/去页眉）与中文友好切分
 │       │   ├── registry.py     文档注册表（JSON 原子写）
-│       │   ├── vectorstore.py  FAISS 索引管理
-│       │   ├── ingest.py       入库流水线
-│       │   ├── rag.py          检索 + 提示词 + 流式生成
+│       │   ├── vectorstore.py  FAISS 索引管理 + 概览取样/阈值兜底
+│       │   ├── ingest.py       入库流水线 + 重建索引
+│       │   ├── rag.py          意图分流 + 提示词 + 流式生成
 │       │   └── ollama_client.py Ollama 探测（带 TTL 缓存）
 │       └── routers/
 │           ├── health.py       健康检查、配置、模型列表
-│           ├── documents.py    上传、列表、分块预览、删除
+│           ├── documents.py    上传、列表、分块预览、重建索引、删除
 │           └── chat.py         问答（SSE/JSON）与纯检索
+├── launcher/
+│   └── RagQaLauncher.cs        RAG-QA.exe 的源码（C# 5，csc.exe 直接编译）
 ├── frontend/                   免构建前端
 │   ├── index.html
 │   └── assets/
 │       ├── css/style.css
 │       └── js/{app.js, api.js, markdown.js}
 ├── scripts/
-│   ├── prepare.ps1 / .cmd      一次性联网准备（装依赖、下模型）
+│   ├── prepare.ps1 / .cmd      一次性联网准备（装依赖、下模型、编译启动器）
 │   ├── start.ps1 / .cmd        离线启动（自动拉起 Ollama）
 │   ├── stop.ps1                停止服务
+│   ├── build-launcher.ps1/.cmd 编译 RAG-QA.exe
+│   ├── fix-encoding.ps1        修 .ps1/.cs 的 UTF-8 BOM、查 .cmd 是否纯 ASCII
 │   ├── download_models.py      下载 HuggingFace 嵌入模型
 │   └── fetch.mjs               通用下载器（支持断点续传）
-├── tests/                      5 套测试，共 175 项断言
+├── tests/                      7 套测试，共 430 项断言
 ├── models/                     本地嵌入模型（离线加载）
 ├── data/                       上传文件、FAISS 索引、日志
 ├── tools/                      便携版 Ollama（可选）
@@ -130,6 +135,29 @@ pwsh -File scripts\prepare.ps1 -LlmModel llama3.2   # 换 LLM
 也就是说：**先启动、后配置**也是可行路径，不必提前读完文档。
 
 ### 第二步：启动
+
+**方式 A（推荐）：双击项目根目录的 `RAG-QA.exe`**
+
+一个 34KB 的一体化启动器（.NET Framework，Win10/11 自带，无需安装任何运行时）：
+
+* 图形面板显示运行状态、模型、知识库规模，一键启动 / 停止 / 打开页面
+* 启动后**先等健康检查通过再打开浏览器**，不会出现「拒绝连接」页
+* **关掉窗口 = 后端和 Ollama 一起停止**（想让它常驻可勾「关闭窗口时最小化到托盘」）
+* 托盘图标常驻：显示面板 / 打开页面 / 停止服务并退出
+* 只允许一个实例：重复双击会把已有面板叫到前台，不会起第二个后端
+
+同样支持命令行调用（写脚本时用得上）：
+
+```powershell
+.\RAG-QA.exe --status          # 环境自检 + 运行状态
+.\RAG-QA.exe --start           # 后台启动（不弹窗口）
+.\RAG-QA.exe --stop            # 停止后端与 Ollama
+.\RAG-QA.exe --stop --keep-ollama
+```
+
+忘了编译或想重新编译：`scripts\build-launcher.cmd`（`prepare.cmd` 也会顺手编译一次）。
+
+**方式 B：命令行窗口**
 
 ```powershell
 pwsh -File scripts\start.ps1
@@ -214,14 +242,19 @@ pwsh -File tests\run_all.ps1
 | 套件 | 断言数 | 依赖 Ollama | 覆盖内容 |
 |------|-------|------------|---------|
 | `check_imports.py` | 24 | 否 | 全部依赖能否按预期路径导入（含切分器的延迟导入路径） |
-| `test_offline.py` | 24 | 否 | 模型完整性、离线加载、归一化、FAISS 检索、切分 |
-| `test_e2e.py` | 76 | 否（假 LLM） | 入库 → 检索 → 提示词 → 流式事件 → 引用 → 删除 → 持久化 → 安装日志解析 → **冷启动导入链 + 浏览器打开时机 + Ollama 安装完整性 + 原生 thinking 通道** |
+| `test_offline.py` | 53 | 否 | 模型完整性、离线加载、归一化、FAISS 检索、切分、**PDF 去页眉/段落还原/参考文献截断、意图识别、近重复去重与取样名额** |
+| `test_e2e.py` | 103 | 否（假 LLM） | 入库 → 检索 → 提示词 → 流式事件 → 引用 → 删除 → 持久化 → 安装日志解析 → 冷启动导入链 → 浏览器打开时机 → Ollama 安装完整性 → 原生 thinking 通道 → **概览检索、阈值兜底、重建索引** |
 | `test_ollama_integration.py` | 45 | 否（协议兼容假服务） | 真实 ChatOllama 往返、NDJSON 流解析、thinking 能力探测、模型预热与退出卸载、错误分支、状态自洽 |
-| `test_http.py` | 102 | 否 | 真实 HTTP 服务：静态托管、上传、检索、SSE 协议、错误码、配置引导、一键安装、JSON charset |
-| `test_frontend.mjs` | 56 | 否（需 Node） | 前端渲染（XSS 转义、引用角标）+ 静态一致性（DOM id、模块导出、`[hidden]` 兜底、无 CDN、环境面板三态） |
+| `test_http.py` | 115 | 否 | 真实 HTTP 服务：静态托管、上传、检索、SSE 协议、错误码、配置引导、一键安装、JSON charset、**重建索引接口、meta 里的检索策略** |
+| `test_frontend.mjs` | 85 | 否（需 Node） | 前端渲染（XSS 转义、引用角标、**列表分点渲染**）+ 静态一致性（DOM id、模块导出、`[hidden]` 兜底、无 CDN、环境面板三态、**检索徽标与重建索引入口**） |
+| `test_launcher.ps1` | 29 | 否 | **一体化启动器**：exe 新鲜度、`--status` 自检、GUI 窗口创建与标题、`--start`/`--stop` 闭环（隔离数据目录、不误杀 Ollama） |
 
-合计 **327 项断言**，外加一个脚本编码/语法与安装链路逻辑的预检。`test_http.py` 里有 1 条断言
-只在 `/api/health` 确实报出问题时才执行（断言这时 `/api/setup` 必须同样判为未就绪）。
+合计 **454 项断言**（脚本会打印实际数字），外加一个脚本编码/语法与安装链路逻辑的预检。
+
+> 测试**不会**碰你的知识库：三个会清空数据的套件都跑在 `RAG_DATA_DIR` 指向的临时目录上，
+> 并且会先断言「当前数据目录不是真实的 `data/`」，否则拒绝执行；
+> HTTP 验收由 `run_all.ps1` 另起一个专用实例（自动挑空闲端口）。
+> 启动器的 `--stop` 在测试里一律加 `--keep-ollama`，不会关掉你自己在用的 Ollama。
 全部套件都**不需要真实 Ollama**：
 第 4 套用一个实现了 Ollama 线格式的假服务，保留真实的 ChatOllama 与 HTTP 客户端，
 因此验证的是真实集成代码，而不是把整层替换掉的 mock。
@@ -635,7 +668,9 @@ Ollama 收到不带 `prompt` 的请求会直接返回 `done_reason: "load"`，
 
 | 动作 | 结果 |
 |------|------|
-| 在启动窗口按 `Ctrl+C` | 后端退出 → 脚本**自动关掉 Ollama**（含本次拉起的、项目内置的、以及之前就在运行的） |
+| 关掉 `RAG-QA.exe` 的面板窗口 | 弹确认 → 后端**和 Ollama 一起停**（勾了「退出时保留 Ollama」则只停后端） |
+| 托盘图标 → 停止服务并退出 | 同上 |
+| 在启动窗口按 `Ctrl+C`（start.cmd） | 后端退出 → 脚本**自动关掉 Ollama**（含本次拉起的、项目内置的、以及之前就在运行的） |
 | `scripts\stop.ps1` | 停后端 **+ 停 Ollama** |
 | `scripts\stop.ps1 -KeepOllama` | 只停后端 |
 | `scripts\start.cmd -KeepOllama` | 启动时正常，退出时**保留** Ollama |
@@ -860,6 +895,69 @@ num_ctx=4096, 10 段中文资料 → prompt_eval=3542, eval=1024, done_reason=le
 想要稳定的溯源角标，请换更大的模型（`llama3.2` / `qwen2.5:3b` 起），
 或在 `.env` 里调大 `RAG_LLM_NUM_CTX` 后重试。检索侧（引用来源列表、点击查看原文分块）
 本身是确定性的，不受影响。
+
+### 36. 一体化启动器 RAG-QA.exe：薄封装，而不是把 Python 打进 exe
+
+需求是「一体化启动和关闭的 exe」。这里有个岔路口，先把取舍讲清楚：
+
+| 方案 | 体积 | 启动 | 风险 |
+|------|------|------|------|
+| PyInstaller onefile 打包后端 | 1.5~3GB | 每次解压到临时目录，慢 | torch + onefile 在 Windows 上极易在解压阶段失败；Ollama（1.4GB）与模型权重仍必须放在外面，最后还是「一个文件夹」 |
+| .NET 9 self-contained | ~70MB | 快 | 要求目标机器装 .NET 9，或把运行时一起打进去 |
+| **本方案：薄启动器（.NET Framework 4.x + csc.exe）** | **34KB** | 瞬时 | 无运行时依赖（Win10 1903+ / 11 自带 .NET Framework 4.8），不联网、不需要 SDK |
+
+关键理由：**编排逻辑只能有一份**。启动/停止里的坑（Ollama 生命周期、端口占用、
+PID/路径/端口三重定位、退出清理）都已经写在 `scripts\start.ps1` / `stop.ps1` 里
+并有测试覆盖；exe 再实现一遍就等于第二个真相来源，迟早两边行为不一致。
+所以 exe 只做四件事：探测状态、按需拉起脚本、盯健康检查、优雅收尾。
+
+```
+RAG-QA.exe                      图形面板（双击，默认）
+RAG-QA.exe --start [--port N]   后台启动并等健康检查通过
+RAG-QA.exe --stop               停止后端与 Ollama（--keep-ollama 只停后端）
+RAG-QA.exe --status [--json]    路径自检 + 运行状态
+```
+
+面板内容：状态（未运行 / 正在启动 / 运行中）、模型与知识库规模、打开页面、启动、
+停止、运行日志（`data\logs` 尾部）、两个勾选项（关闭窗口时最小化到托盘 /
+退出时保留 Ollama）、托盘图标菜单（显示面板 / 打开页面 / 停止服务并退出）。
+**关窗口 = 停服务（含 Ollama）**是默认行为，与「退出时把 Ollama 一起收掉」一致；
+想让它常驻就勾上最小化到托盘。同一时刻只允许一个实例，再次双击会把已有面板叫到前台。
+
+编译：`scripts\build-launcher.cmd`（`prepare.cmd` 会顺手编译一次），
+源码 `launcher\RagQaLauncher.cs`，编译产物已经随仓库提供。
+
+**这些坑全是实测踩出来的**，写在这里免得下次再踩：
+
+1. **`csc.exe` 只支持 C# 5**。源码里因此没有字符串插值、`?.`、表达式体成员。
+   换来的是「目标机器零运行时安装」，值得。
+2. **`.cs` 必须有 UTF-8 BOM**。csc 靠 BOM 判断源文件编码，没有 BOM 就按 ANSI(936)
+   解析，界面上的中文全成乱码。`fix-encoding.ps1` 现在把 `.cs` 一起检查。
+3. **`AttachConsole` 会覆盖已重定向的标准句柄**。`RAG-QA.exe --status > out.txt`
+   若先附着父控制台再输出，文件是 0 字节而退出码是 0。
+   现在先判断 stdout 是否已被重定向，是则**不**附着。
+4. **`Console.OutputEncoding` 在没有控制台时会抛异常**。它和 `Console.SetOut`
+   放在同一段 try 里，异常一发生 SetOut 就被跳过，输出按 OEM 代码页(936)编码 ——
+   重定向到文件的中文全乱码。现在两者分开 try。
+5. **别给 `powershell.exe` 传 `-WindowStyle Hidden`**。那样 PowerShell 自己没有控制台，
+   `start.ps1` 会卡在启动阶段（连转录文件都不生成），而进程还活着，极难判断。
+   隐藏窗口要用 `ProcessStartInfo.WindowStyle`（等价于 `Start-Process -WindowStyle Hidden`）。
+6. **不要用 `*> 文件` 收集 start.ps1 的输出**。PS 5.1 会把「被重定向的原生命令 stderr」
+   当成 NativeCommandError 终止错误：uvicorn 刚写第一行日志，脚本就被弹飞，端口根本没监听。
+   改用 `Start-Transcript`（走宿主输出通道，不碰原生命令的流）。
+7. **PowerShell 不等待 GUI 子系统的程序**。脚本里直接 `& RAG-QA.exe --status`
+   既拿不到输出也拿不到退出码，必须借道 `cmd /c`；
+   而 `Start-Process -RedirectStandardOutput` 在受限环境会「拒绝访问」
+   （.NET 的进程重定向在 Windows 上走匿名管道）。
+8. **别用 `Process.MainWindowTitle` 判断界面是否正常**。它只报告**可见**窗口，
+   在无人交互的会话（CI / 沙箱）里永远为空，会把「正常」误判成失败。
+   验收脚本改成 `EnumWindows` 枚举该进程的顶层窗口并校验标题文本。
+
+顺带修掉一个真 bug：`stop.ps1` 的「按端口兜底」用的是 `Get-NetTCPConnection`，
+它在受限账户下直接抛「拒绝访问」，那条路径形同虚设 ——
+表现就是点「停止」没反应、或报「没有发现运行中的后端」而端口还开着。
+现在改用 `lib\ollama-runtime.ps1` 里的 `Get-PortListenerProcessId`（netstat 解析），
+启动器另外再加一层 `taskkill /T /F` 兜底。
 
 ---
 
