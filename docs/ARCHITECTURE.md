@@ -41,7 +41,7 @@
 上传 → save_upload()                     写盘 + 大小/类型校验
      → sha256_of()                       内容指纹
      → registry.find_by_hash()           命中则直接复用，不重复索引
-     → parse_document()                  按格式解析 + 中文友好切分
+     → parse_document()                  按格式解析 + 版面还原 + 中文友好切分
      → vector_store.add_chunks()         向量化并写入 FAISS，落盘
      → registry.add()                    记录 doc_id → faiss_ids 映射
 ```
@@ -57,23 +57,49 @@ FAISS 只能按向量 id 删除。把「文档 → 它的所有 chunk id」记�
 段落 → 句号/问号/感叹号 → 分号 → 逗号 → 空格 → 字符。
 重叠 120 字符，避免答案正好被切断。长度小于 10 字符的碎片被丢弃（只引入噪声）。
 
+**PDF 解析的版面还原**（解析逻辑变了必须重建索引：`POST /api/documents/reindex`）
+
+PDF 抽出来的是「一行一行」的硬换行，直接切分会产生大量结构性噪声。
+入库前按顺序做三步处理（`app/services/loader.py`）：
+
+| 步骤 | 做什么 | 不做会怎样（实测同一篇 4 页期刊论文） |
+|------|--------|--------------------------------------|
+| `strip_repeated_lines()` | 删除出现在 ≥60% 页面上、长度 ≤100 字的重复行（比较时去掉所有空白） | 页眉是「关键词拼盘」，对任何提问相似度都高，top-6 里 3 条是同一段页眉的不同页副本 |
+| `strip_reference_sections()` | 截掉独占一行的「参考文献 / References」及其后的编号条目（≥2 条才动手） | 参考文献对「总结主要内容」拿到 0.420（全场第一），却提供不了任何可用信息 |
+| `insert_paragraph_breaks()` | 小节标题（`1.1` / `2.2.3` / `0 引言`）与中英文切换处补空行 | 切分器只能在第 800 字硬切，中文正文和英文摘要粘成一块，相似度从 0.367 掉到 0.147 |
+
 ---
 
 ## 3. 问答流程
 
 ```
 问题
- ├─ vector_store.search()
- │    ├─ embed_query()                  384 维归一化向量
- │    ├─ FAISS IndexFlatIP 检索          内积 == 余弦相似度
- │    ├─ 按 doc_ids 过滤（可选）          多取 20 倍候选再筛
- │    └─ 按 score_threshold 过滤
+ ├─ detect_intent()                      规则判定：overview / qa
  │
- ├─ 无召回 → 直接返回兜底话术，不浪费一次推理
+ ├─ overview（总结类：总结/概述/概括/摘要/主要内容/讲了什么… 且 ≤60 字）
+ │    └─ vector_store.overview_chunks()
+ │         ├─ 按阅读顺序列出全部片段（可选 doc_ids 过滤）
+ │         ├─ 近重复去重（字符 4-gram Jaccard ≥ 0.8 只留一条）
+ │         ├─ 按文档分配名额（每篇保底，其余按块数比例）
+ │         ├─ 每篇内部均匀取样（首尾必取），覆盖「开头—中间—结尾」
+ │         └─ 按 max_context_chars 装箱 → 忽略相似度阈值
+ │
+ ├─ qa（其余）
+ │    └─ vector_store.search_detailed()
+ │         ├─ embed_query()               384 维归一化向量
+ │         ├─ FAISS IndexFlatIP 检索        内积 == 余弦相似度
+ │         ├─ 按 doc_ids 过滤（可选）       多取候选再筛
+ │         ├─ 近重复去重                   页眉副本只留分数最高的一条
+ │         ├─ 相对窗口：score ≥ max(阈值, 最佳−score_window)
+ │         └─ 阈值内无命中 → 放宽到 max(score_floor, 最佳−窗口) 并标记 relaxed
+ │                              （阈值高于 score_relax_limit 时不擅自放宽）
+ │
+ ├─ 无召回（且未放宽）→ 直接返回兜底话术，不浪费一次推理
  │
  ├─ build_context()                     拼装 [n] 来源：文件（页码）+ 正文
  │                                      按 max_context_chars 截断
- ├─ build_messages()                    System(规则 + 参考资料) + 历史 + 当前问题
+ ├─ build_messages()                    System(规则 + 资料来源) + 历史 + 当前问题
+ │                                      overview 用 OVERVIEW_PROMPT，qa 用 SYSTEM_PROMPT
  │
  └─ ChatOllama.astream()
       ├─ ThinkSplitter 剥离推理链        逐 token 缓冲，处理标签被切碎
