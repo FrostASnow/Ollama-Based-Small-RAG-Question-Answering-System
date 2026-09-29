@@ -624,13 +624,28 @@ if (-not $SkipOllama -and (Test-Path $OllamaExe) -and -not (Test-OllamaPayload $
     Write-Host '[OK]   内置 Ollama 运行时完整' -ForegroundColor Green
 }
 
+Write-Step '一体化启动器（RAG-QA.exe）'
+# 有 .NET Framework 的 csc.exe 就顺手编译启动器，用户双击它即可启动/停止。
+# 失败不是致命问题：仍然可以用 start.cmd / stop.cmd。
+try {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build-launcher.ps1') *> $null
+    if ($LASTEXITCODE -eq 0 -and (Test-Path (Join-Path $ProjectRoot 'RAG-QA.exe'))) {
+        Write-Host '[OK]   RAG-QA.exe 已就绪（双击即可启动 / 停止）' -ForegroundColor Green
+    } else {
+        Write-Host '[WARN] 启动器未编译成功，改用 scripts\start.cmd 与 stop.cmd' -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "[WARN] 启动器编译被跳过：$($_.Exception.Message)" -ForegroundColor Yellow
+}
+
 Write-Host @"
 
 ============================================================================
  准备完成
 ============================================================================
  下一步：
-     启动服务   双击 scripts\start.cmd
+     启动服务   双击 RAG-QA.exe       （图形面板，关掉即停止）
+     或         双击 scripts\start.cmd （命令行窗口）
 ============================================================================
 "@ -ForegroundColor Green
 

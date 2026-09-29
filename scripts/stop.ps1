@@ -29,9 +29,18 @@ function Write-Warn2($text) { Write-Host "[WARN] $text" -ForegroundColor Yellow 
 
 Write-Host '=== 停止后端 ===' -ForegroundColor Cyan
 
+# 公共运行时助手（netstat 解析、按端口找进程等）。这里提前载入：
+# 下面「按端口兜底」和「停 Ollama」都要用它。
+$lib = Join-Path $PSScriptRoot 'lib\ollama-runtime.ps1'
+if (-not (Test-Path $lib)) {
+    Write-Err "缺少 $lib，无法安全停止"
+    exit 1
+}
+. $lib
+
 # 精确匹配本项目 venv 启动的 uvicorn，避免误杀其他 Python 进程
 $killed = 0
-$procs = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue
+$procs = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue)
 foreach ($p in $procs) {
     $cmd = $p.CommandLine
     if ($cmd -and $cmd -like "*uvicorn*app.main:app*" -and $cmd -like "*$ProjectRoot*") {
@@ -41,21 +50,31 @@ foreach ($p in $procs) {
     }
 }
 
-# 回退：按端口占用查找
+# 回退：按端口占用查找。
+# 注意不要用 Get-NetTCPConnection：它在受限账户/受限环境里会直接抛「拒绝访问」，
+# 于是整条回退路径形同虚设（实测：-launcher 的 --stop 就是卡在这里，
+# 端口明明还在监听，脚本却报「没有发现运行中的后端」）。
+# Get-PortListenerProcessId 走 netstat -ano 解析，不需要额外权限。
 if ($killed -eq 0) {
-    $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-    foreach ($c in $conn) {
-        $proc = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
-        if ($proc -and $proc.ProcessName -eq 'python') {
-            Write-Host "  结束占用 $Port 端口的进程 PID=$($proc.Id)"
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-            $killed++
-        }
+    $owner = Get-PortListenerProcessId -Port $Port
+    if ($owner -gt 0) {
+        $proc = Get-Process -Id $owner -ErrorAction SilentlyContinue
+        $name = if ($proc) { $proc.ProcessName } else { 'unknown' }
+        Write-Host "  结束占用 $Port 端口的进程 PID=$owner（$name）"
+        Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue
+        $killed++
     }
 }
 
-if ($killed -eq 0) { Write-Host '  没有发现运行中的后端。' -ForegroundColor Gray }
-else { Write-Host "[OK]   已停止 $killed 个后端进程" -ForegroundColor Green }
+if ($killed -eq 0 -and (Get-PortListenerProcessId -Port $Port) -le 0) {
+    Write-Host '  没有发现运行中的后端。' -ForegroundColor Gray
+} elseif ($killed -gt 0) {
+    Write-Host "[OK]   已停止 $killed 个后端进程" -ForegroundColor Green
+    # 给操作系统一点时间回收监听套接字，避免调用方紧接着探测时仍看到 TIME_WAIT/监听
+    Start-Sleep -Milliseconds 300
+} else {
+    Write-Warn2 "端口 $Port 仍被占用，但未能结束占用进程"
+}
 
 if ($KeepOllama) {
     Write-Host '=== 保留 Ollama（-KeepOllama）===' -ForegroundColor Cyan
@@ -63,17 +82,10 @@ if ($KeepOllama) {
 } else {
     Write-Host '=== 停止 Ollama ===' -ForegroundColor Cyan
 
-    # 与 start.ps1 退出时走同一套逻辑（scripts\lib\ollama-runtime.ps1）：
+    # 与 start.ps1 退出时走同一套逻辑（scripts\lib\ollama-runtime.ps1，已在上面载入）：
     #   1. 项目内置的那份（路径在 tools\ollama 下）
     #   2. 端口 11434 上仍在监听的（可能是之前留下或系统安装的）
     # 这样「后端停了、Ollama 还在后台吃显存」的情况不会出现。
-    $lib = Join-Path $PSScriptRoot 'lib\ollama-runtime.ps1'
-    if (-not (Test-Path $lib)) {
-        Write-Err "缺少 $lib，无法安全停止 Ollama"
-        exit 1
-    }
-    . $lib
-
     $stopped = @(Stop-PortableOllamaForProject -Dir (Join-Path $ProjectRoot 'tools\ollama') -Port 11434)
     if ($stopped.Count -gt 0) {
         Write-Host "[OK]   已停止 Ollama（PID $($stopped -join ', ')）" -ForegroundColor Green
