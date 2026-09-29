@@ -81,7 +81,7 @@ Write-Host ('=' * 74) -ForegroundColor DarkGray
 
 $scriptOk = $true
 
-foreach ($rel in @('scripts\prepare.ps1', 'scripts\start.ps1', 'scripts\stop.ps1', 'scripts\fix-encoding.ps1', 'scripts\build-launcher.ps1', 'scripts\lib\ollama-runtime.ps1', 'tests\run_all.ps1', 'tests\test_launcher.ps1', 'launcher\RagQaLauncher.cs')) {
+foreach ($rel in @('scripts\prepare.ps1', 'scripts\start.ps1', 'scripts\stop.ps1', 'scripts\fix-encoding.ps1', 'scripts\build-launcher.ps1', 'scripts\lib\ollama-runtime.ps1', 'tests\run_all.ps1', 'tests\test_launcher.ps1', 'tests\hang-probe.ps1', 'launcher\RagQaLauncher.cs')) {
     $path = Join-Path $ProjectRoot $rel
     $bytes = [System.IO.File]::ReadAllBytes($path)
 

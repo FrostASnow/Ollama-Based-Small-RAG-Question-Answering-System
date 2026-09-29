@@ -277,6 +277,18 @@ namespace RagQaLauncher
 
         public static Health Check(int port, int timeoutMs)
         {
+            // 先探 TCP，只有端口真的有人听才发 HTTP。
+            //
+            // 为什么必须这样：本机连一个**关闭**的端口未必会立刻被拒绝 ——
+            // 实测这台机器上对 127.0.0.1 的关闭端口发起连接要等满 2 秒
+            // （SYN 被静默丢弃而不是回 RST）。20 个端口就是 40 秒。
+            if (!TcpOpen(port, 150)) return null;
+            return CheckHttp(port, timeoutMs);
+        }
+
+        /// <summary>直接发 HTTP 探测（不做 TCP 预检）。</summary>
+        public static Health CheckHttp(int port, int timeoutMs)
+        {
             string json = HttpGet("http://127.0.0.1:" + port + "/api/health", timeoutMs);
             if (json == null) return null;
 
@@ -329,19 +341,42 @@ namespace RagQaLauncher
             return false;
         }
 
-        /// <summary>在候选端口里找正在运行的本项目服务（含状态文件里记过的端口）。</summary>
+        /// <summary>
+        /// 快速探测：只看「状态文件记过的端口」和「首选端口」。
+        ///
+        /// 定时刷新必须走这条路径。扫 20 个端口看着无害，但在「关闭端口不会立刻
+        /// 拒绝连接」的机器上，一次刷新要几十秒 —— 放在 UI 线程上就是窗口
+        /// 一直「未响应」（实测 82% 的采样点被阻塞，用户看到的就是疯狂卡死）。
+        /// </summary>
+        public static Health FindRunningQuick(AppLayout layout, int preferredPort, int lastKnownPort)
+        {
+            List<int> ports = new List<int>();
+            if (lastKnownPort > 0) ports.Add(lastKnownPort);
+            if (preferredPort > 0 && !ports.Contains(preferredPort)) ports.Add(preferredPort);
+            int remembered = ReadStatePort(layout);
+            if (remembered > 0 && !ports.Contains(remembered)) ports.Add(remembered);
+
+            foreach (int port in ports)
+            {
+                Health h = Check(port, 800);
+                if (h != null && h.Ok) return h;
+            }
+            return null;
+        }
+
+        /// <summary>在候选端口里做一次完整扫描（较慢，只用于启动时/用户手动刷新）。</summary>
         public static Health FindRunning(AppLayout layout, int preferredPort)
         {
             List<int> ports = new List<int>();
             ports.Add(preferredPort);
             int remembered = ReadStatePort(layout);
             if (remembered > 0 && remembered != preferredPort) ports.Add(remembered);
-            for (int p = 8000; p <= 8019; p++)
+            for (int p = 8000; p <= 8009; p++)
                 if (!ports.Contains(p)) ports.Add(p);
 
             foreach (int port in ports)
             {
-                Health h = Check(port, 700);
+                Health h = Check(port, 800);
                 if (h != null && h.Ok) return h;
             }
             return null;
@@ -830,6 +865,15 @@ namespace RagQaLauncher
         private bool _busy;
         private bool _exiting;
 
+        // 后台刷新线程用：最后一次确认在跑的端口；完整扫描的节流时间戳
+        private volatile int _lastKnownPort;
+        private volatile bool _refreshPending;
+        private long _lastFullScanTicks;
+        private string _logTail = "";
+        // 0=空闲 1=启动中 2=停止中。用独立状态而不是 _busy：
+        // 否则停止过程中会被刷新线程覆盖成「正在启动…」，状态显示来回跳。
+        private volatile int _phase;
+
         public MainForm(Options options, EventWaitHandle showSignal)
         {
             _options = options;
@@ -841,11 +885,123 @@ namespace RagQaLauncher
             watcher.IsBackground = true;
             watcher.Start();
 
+            // 状态刷新放在后台线程：探测要发 HTTP/建连接，**绝不能**在 UI 线程上做。
+            // 之前就是在这里栽的 —— 关闭端口不立刻拒绝连接的机器上，
+            // 一个刷新周期要几十秒，窗口表现为持续「未响应」。
+            Thread refresher = new Thread(RefreshLoop);
+            refresher.IsBackground = true;
+            refresher.Start();
+
             Load += delegate
             {
                 Log.Write(_layout, "启动器已打开，项目根目录 " + _layout.Root);
-                RefreshState();
+                RequestRefresh();
             };
+        }
+
+        // ------------------------------------------------------------------
+        // 后台刷新
+        // ------------------------------------------------------------------
+        private void RequestRefresh()
+        {
+            _refreshPending = true;
+        }
+
+        private void RefreshLoop()
+        {
+            bool firstPass = true;
+            while (!_exiting)
+            {
+                bool due = _refreshPending || firstPass;
+                _refreshPending = false;
+                firstPass = false;
+
+                if (due)
+                {
+                    try { CollectState(); }
+                    catch { }
+                }
+                Thread.Sleep(500);
+            }
+        }
+
+        private void CollectState()
+        {
+            Health health = Probe.FindRunningQuick(_layout, _options.Port, _lastKnownPort);
+
+            // 快路径没找到 → 隔一段时间做一次完整扫描（仍然在后台线程上，慢点没关系）
+            if (health == null)
+            {
+                long now = DateTime.UtcNow.Ticks;
+                long lastScan = Interlocked.Read(ref _lastFullScanTicks);
+                if (lastScan == 0 || (now - lastScan) > TimeSpan.TicksPerSecond * 15)
+                {
+                    Interlocked.Exchange(ref _lastFullScanTicks, now);
+                    health = Probe.FindRunning(_layout, _options.Port);
+                }
+            }
+            if (health != null) _lastKnownPort = health.Port;
+
+            bool ollama = Probe.TcpOpen(11434, 200);
+            string tail = Log.Tail(_layout.BackendLog, 24, 32 * 1024);
+            if (tail.Length == 0) tail = Log.Tail(_layout.StartLog, 24, 32 * 1024);
+            if (tail.Length == 0) tail = Log.Tail(_layout.LauncherLog, 24, 32 * 1024);
+
+            try
+            {
+                BeginInvoke(new MethodInvoker(delegate { ApplyState(health, ollama, tail); }));
+            }
+            catch
+            {
+                // 窗口已销毁
+            }
+        }
+
+        /// <summary>只做界面更新，不含任何 IO —— 保证 UI 线程永远轻快。</summary>
+        private void ApplyState(Health health, bool ollama, string tail)
+        {
+            _health = health;
+
+            if (health != null)
+            {
+                _stateLabel.Text = "状态：运行中";
+                _stateLabel.ForeColor = Color.FromArgb(22, 163, 74);
+                _detailLabel.Text = health.Url + "   ·   模型 " + health.Model +
+                                    "   ·   Ollama " + (ollama ? "运行中" : "未运行");
+                _kbLabel.Text = "知识库：" + health.Documents + " 个文档 / " + health.Chunks + " 个分块";
+            }
+            else if (_phase == 2)
+            {
+                _stateLabel.Text = "状态：正在停止…";
+                _stateLabel.ForeColor = Color.FromArgb(217, 119, 6);
+                _detailLabel.Text = _keepOllama.Checked ? "正在停止后端（保留 Ollama）…" : "正在停止后端与 Ollama…";
+                _kbLabel.Text = "";
+            }
+            else if (_phase == 1)
+            {
+                _stateLabel.Text = "状态：正在启动…";
+                _stateLabel.ForeColor = Color.FromArgb(217, 119, 6);
+                _detailLabel.Text = "首次冷启动需要十几秒（要载入嵌入模型与 LLM）";
+                _kbLabel.Text = "";
+            }
+            else
+            {
+                _stateLabel.Text = "状态：未运行";
+                _stateLabel.ForeColor = Color.DimGray;
+                _detailLabel.Text = _layout.ReadyToStart()
+                    ? "点「启动服务」即可，日志会写进 " + _layout.LogsDir
+                    : "环境不完整，请先运行 scripts\\prepare.cmd（首次需要联网）";
+                _kbLabel.Text = "Ollama：" + (ollama ? "运行中" : "未运行");
+            }
+
+            _openButton.Enabled = health != null;
+            _stopButton.Enabled = health != null;
+
+            if (tail != _logTail)
+            {
+                _logTail = tail;
+                _logBox.Text = tail;
+            }
         }
 
         // ------------------------------------------------------------------
@@ -899,7 +1055,7 @@ namespace RagQaLauncher
             _startButton = MakeButton("启动服务", 140, 168, 110);
             _startButton.Click += delegate { StartService(); };
             _stopButton = MakeButton("停止服务", 260, 168, 110);
-            _stopButton.Click += delegate { StopService(true); };
+            _stopButton.Click += delegate { StopServiceAsync(true, false); };
             Button exitButton = MakeButton("退出", 380, 168, 110);
             exitButton.Click += delegate { Close(); };
 
@@ -940,13 +1096,15 @@ namespace RagQaLauncher
             menu.Items.Add("显示面板", null, delegate { RestoreWindow(); });
             menu.Items.Add("打开页面", null, delegate { if (_health != null) Program.OpenBrowser(_health.Url); });
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("停止服务并退出", null, delegate { StopService(true); Close(); });
+            menu.Items.Add("停止服务并退出", null, delegate { StopServiceAsync(true, true); });
             _tray.ContextMenuStrip = menu;
             _tray.DoubleClick += delegate { RestoreWindow(); };
 
             _timer = new System.Windows.Forms.Timer();
-            _timer.Interval = 2500;
-            _timer.Tick += delegate { RefreshState(); };
+            // 计时器只负责「请求一次刷新」，真正的探测在后台线程做。
+            // 以前这里直接调 RefreshState()（内部发 HTTP），窗口必然卡死。
+            _timer.Interval = 1500;
+            _timer.Tick += delegate { RequestRefresh(); };
             _timer.Start();
         }
 
@@ -991,46 +1149,7 @@ namespace RagQaLauncher
         }
 
         // ------------------------------------------------------------------
-        private void RefreshState()
-        {
-            if (_busy) return;
-            _health = Probe.FindRunning(_layout, _options.Port);
-            bool ollama = Probe.TcpOpen(11434, 400);
-
-            if (_health != null)
-            {
-                _stateLabel.Text = "状态：运行中";
-                _stateLabel.ForeColor = Color.FromArgb(22, 163, 74);
-                _detailLabel.Text = _health.Url + "   ·   模型 " + _health.Model +
-                                    "   ·   Ollama " + (ollama ? "运行中" : "未运行");
-                _kbLabel.Text = "知识库：" + _health.Documents + " 个文档 / " + _health.Chunks + " 个分块";
-            }
-            else if (_child != null && !_child.HasExited)
-            {
-                _stateLabel.Text = "状态：正在启动…";
-                _stateLabel.ForeColor = Color.FromArgb(217, 119, 6);
-                _detailLabel.Text = "首次冷启动需要十几秒（要载入嵌入模型与 LLM）";
-                _kbLabel.Text = "";
-            }
-            else
-            {
-                _stateLabel.Text = "状态：未运行";
-                _stateLabel.ForeColor = Color.DimGray;
-                _detailLabel.Text = _layout.ReadyToStart()
-                    ? "点「启动服务」即可，日志会写进 " + _layout.LogsDir
-                    : "环境不完整，请先运行 scripts\\prepare.cmd（首次需要联网）";
-                _kbLabel.Text = "Ollama：" + (ollama ? "运行中" : "未运行");
-            }
-
-            _openButton.Enabled = _health != null;
-            _stopButton.Enabled = _health != null;
-
-            string tail = Log.Tail(_layout.BackendLog, 24, 32 * 1024);
-            if (tail.Length == 0) tail = Log.Tail(_layout.StartLog, 24, 32 * 1024);
-            if (tail.Length == 0) tail = Log.Tail(_layout.LauncherLog, 24, 32 * 1024);
-            if (_logBox.Text != tail) _logBox.Text = tail;
-        }
-
+        // 启动 / 停止（都不阻塞 UI 线程）
         // ------------------------------------------------------------------
         private void StartService()
         {
@@ -1040,64 +1159,109 @@ namespace RagQaLauncher
                     "无法启动", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            _busy = true;
-            try
-            {
-                _child = Service.Start(_layout, _options.Port, true, _keepOllama.Checked);
-                Service.WriteState(_layout, _options.Port, _child != null ? _child.Id : 0);
-                RefreshState();
+            if (_busy) return;
 
-                // 等健康检查通过再开浏览器 —— 不能靠猜时间，
-                // 否则用户先看到的是「127.0.0.1 拒绝连接」。
-                ThreadPool.QueueUserWorkItem(delegate
+            _busy = true;
+            _phase = 1;
+            _stateLabel.Text = "状态：正在启动…";
+            _stateLabel.ForeColor = Color.FromArgb(217, 119, 6);
+            _detailLabel.Text = "首次冷启动需要十几秒（要载入嵌入模型与 LLM）";
+            _startButton.Enabled = false;
+
+            // 拉起脚本 + 等健康检查，全都在后台线程；UI 只负责显示进度
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Process child = null;
+                Health health = null;
+                try
                 {
-                    Health health = null;
+                    child = Service.Start(_layout, _options.Port, true, _keepOllama.Checked);
+                }
+                catch (Exception ex)
+                {
+                    Log.Write(_layout, "启动失败：" + ex.Message);
+                }
+                if (child != null)
+                {
+                    Service.WriteState(_layout, _options.Port, child.Id);
                     Stopwatch watch = Stopwatch.StartNew();
-                    while (watch.ElapsedMilliseconds < 120000)
+                    while (watch.ElapsedMilliseconds < 120000 && !_exiting)
                     {
                         health = Probe.Check(_options.Port, 1500);
                         if (health != null && health.Ok) break;
                         Thread.Sleep(500);
                     }
-                    Health ready = health;
-                    try
+                }
+
+                Process started = child;
+                Health ready = health;
+                try
+                {
+                    BeginInvoke(new MethodInvoker(delegate
                     {
-                        BeginInvoke(new MethodInvoker(delegate
+                        _busy = false;
+                        _phase = 0;
+                        _child = started;
+                        _startButton.Enabled = true;
+                        if (ready != null && ready.Ok)
                         {
-                            _busy = false;
-                            RefreshState();
-                            if (ready != null && ready.Ok) Program.OpenBrowser(ready.Url);
-                        }));
-                    }
-                    catch { }
-                });
-            }
-            catch (Exception ex)
-            {
-                _busy = false;
-                MessageBox.Show(this, "启动失败：" + ex.Message, "错误",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
+                            _lastKnownPort = ready.Port;
+                            ApplyState(ready, Probe.TcpOpen(11434, 200), _logTail);
+                            // 健康检查通过后才开浏览器，避免「127.0.0.1 拒绝连接」页
+                            Program.OpenBrowser(ready.Url);
+                        }
+                        else
+                        {
+                            MessageBox.Show(this,
+                                "启动超时或失败，请查看日志：\r\n" + _layout.StartLog,
+                                "启动未完成", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        }
+                        RequestRefresh();
+                    }));
+                }
+                catch { }
+            });
         }
 
-        private void StopService(bool askOllama)
+        /// <summary>停止服务。必须异步：stop.ps1 最长要跑几十秒，同步做就是「未响应」。</summary>
+        private void StopServiceAsync(bool askOllama, bool thenClose)
         {
-            if (_health == null && (_child == null || _child.HasExited)) { RefreshState(); return; }
-
+            if (_busy) return;
             bool keep = askOllama && _keepOllama.Checked;
+
             _busy = true;
+            _phase = 2;
             _stateLabel.Text = "状态：正在停止…";
             _stateLabel.ForeColor = Color.FromArgb(217, 119, 6);
-            try
+            _detailLabel.Text = keep ? "正在停止后端（保留 Ollama）…" : "正在停止后端与 Ollama…";
+
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                Service.Stop(_layout, _options.Port, keep, 60000);
-            }
-            finally
-            {
-                _busy = false;
-                _child = null;
-                RefreshState();
-            }
+                try { Service.Stop(_layout, _options.Port, keep, 45000); }
+                catch (Exception ex) { Log.Write(_layout, "停止失败：" + ex.Message); }
+
+                try
+                {
+                    BeginInvoke(new MethodInvoker(delegate
+                    {
+                        _busy = false;
+                        _phase = 0;
+                        _child = null;
+                        _lastKnownPort = 0;
+                        _health = null;
+                        if (thenClose)
+                        {
+                            _exiting = true;
+                            Close();
+                        }
+                        else
+                        {
+                            RequestRefresh();
+                        }
+                    }));
+                }
+                catch { }
+            });
         }
 
         // ------------------------------------------------------------------
@@ -1114,6 +1278,12 @@ namespace RagQaLauncher
             bool running = _health != null || (_child != null && !_child.HasExited);
             if (!_exiting && running)
             {
+                if (_busy)
+                {
+                    // 正在启动/停止中，等它走完：不弹窗、不阻塞
+                    e.Cancel = true;
+                    return;
+                }
                 string question = _keepOllama.Checked
                     ? "退出会停止后端服务（按当前设置保留 Ollama）。确定退出？"
                     : "退出会停止后端服务，并关闭 Ollama 进程。确定退出？";
@@ -1124,7 +1294,11 @@ namespace RagQaLauncher
                     e.Cancel = true;
                     return;
                 }
-                StopService(false);
+                // 取消这次关闭，改成「后台停止 → 完成后自己关」。
+                // 直接在这里同步停止会让窗口卡住几十秒（也就是「未响应」）。
+                e.Cancel = true;
+                StopServiceAsync(false, true);
+                return;
             }
 
             _exiting = true;

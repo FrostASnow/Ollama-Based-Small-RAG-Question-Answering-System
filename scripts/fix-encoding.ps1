@@ -30,7 +30,8 @@ $ps1Files = @(
     'scripts\build-launcher.ps1',
     'scripts\lib\ollama-runtime.ps1',
     'tests\run_all.ps1',
-    'tests\test_launcher.ps1'
+    'tests\test_launcher.ps1',
+    'tests\hang-probe.ps1'
 )
 # .cs 同样需要 BOM：csc.exe 靠 BOM 判断源文件编码，
 # 没有 BOM 时会按系统 ANSI(936) 解析，中文界面文字全变乱码。

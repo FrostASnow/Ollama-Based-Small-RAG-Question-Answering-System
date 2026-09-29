@@ -959,6 +959,47 @@ RAG-QA.exe --status [--json]    路径自检 + 运行状态
 现在改用 `lib\ollama-runtime.ps1` 里的 `Get-PortListenerProcessId`（netstat 解析），
 启动器另外再加一层 `taskkill /T /F` 兜底。
 
+### 37. 「使用过程中疯狂未响应」：探测绝不能在 UI 线程上做
+
+用户反馈面板「疯狂未响应」。这类问题的判据是明确的：**Windows 认为「窗口线程 5 秒没取消息」
+就是未响应**。所以先用 `SendMessageTimeout(WM_NULL)` 把它量化（探针见
+`tests/hang-probe.ps1`，也可 `--Seconds 30` 长时间采样）：
+
+```
+修复前：采样 62 次 / 阻塞 51 次（82.3%）   ← 几乎全程卡死
+修复后：采样 100 次 / 阻塞 0 次（0.0%）/ 单次最长 1ms
+```
+
+根因不在探测逻辑「慢」，而在于**它跑在 UI 线程上，而且本机连关闭端口不会立刻被拒绝**。
+实测这台机器对 127.0.0.1 上 20 个**关闭**端口发起 TCP 连接：
+
+```
+20 个端口总耗时 40100ms（每个约 2.0 秒）—— SYN 被静默丢弃，而不是回 RST
+（正常本机应当是毫秒级的 connection refused）
+```
+
+而旧代码每 2.5 秒在 UI 线程上顺序扫 `8000..8019` 共 21 个端口（每个先 TCP 再 HTTP）。
+一个刷新周期就是几十秒，窗口自然一直「未响应」。
+
+改法（四层，任何一层单独都不够）：
+
+1. **探测全部搬到后台线程**：一个常驻刷新线程，UI 线程只做 `ApplyState()`，
+   里面没有任何 IO；结果用 `BeginInvoke` 回投。
+2. **每次只探已知端口**（状态文件记过的 + 首选端口，≤2 个），完整扫描降级为
+   15 秒一次、且照样在后台线程上跑。
+3. **先 TCP 预检再发 HTTP**：端口没人听（150ms 内连不上）就根本不做 HTTP 请求。
+4. **启动/停止也异步化**：停止最长要跑 45 秒，同步做同样是「未响应」；
+   关窗口改成「取消本次关闭 → 后台停止 → 完成后自己关窗口」。
+
+顺带把计时器从 2.5s 调到 1.5s（现在它只置一个标志位，几乎零成本），状态更新更跟手。
+
+回归测试：`tests/test_launcher.ps1` 现在会真的去采样 UI 响应性 ——
+**服务未运行时 8 秒 + 服务运行中 6 秒，断言 0 次阻塞**。这条断言能抓住的正是
+「又有人在 UI 线程里加了网络/IO 调用」。
+
+顺带确认 Web 端不是瓶颈：`renderMarkdown` 在 10200 字的回答上单次 0.81ms，
+而流式刷新间隔是 90ms（有 100 倍余量）。
+
 ---
 
 ## 已知限制
@@ -1025,6 +1066,29 @@ RAG_EMBEDDING_DIMENSION=512
 
 **报「Ollama 中没有模型 xxx」**
 执行 `ollama pull deepseek-r1:1.5b`。
+
+**RAG-QA.exe 的面板一直显示「未响应」**
+已在实现要点 37 修掉（UI 线程上做网络探测）。如果你的 exe 还是旧的，
+重新编译一次：`scripts\build-launcher.cmd`。
+想量化确认，可以跑 `powershell -File tests\hang-probe.ps1 -Seconds 20`：
+正常应当是「阻塞 0 次」。
+
+**改了 .ps1 之后脚本报一堆 `Unexpected token` / 中文变乱码**
+编辑工具（包括 AI 助手）保存 `.ps1` 时常常丢掉 UTF-8 BOM，
+Windows PowerShell 5.1 于是按 GBK 解析，报的错和真正原因毫无关系。
+先跑修复器：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fix-encoding.ps1
+```
+
+注意修复器**自己**也可能被弄丢 BOM，那时它连启动都失败。用这一行手动补
+（只补 BOM，不动内容）：
+
+```powershell
+$p='scripts\fix-encoding.ps1'; $b=[IO.File]::ReadAllBytes($p)
+if ($b[0] -ne 0xEF) { [IO.File]::WriteAllText($p,[IO.File]::ReadAllText($p,[Text.UTF8Encoding]::new($false)),[Text.UTF8Encoding]::new($true)) }
+```
 
 **提问时报 `error starting llama-server: llama-server binary not found`**
 Ollama **装了一半**：`tools\ollama\` 下只有 `ollama.exe`，缺 `lib\ollama\` 里的推理运行时

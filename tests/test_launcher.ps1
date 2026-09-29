@@ -112,6 +112,104 @@ function Find-FreePort([int]$Start) {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# UI 线程响应性采样
+# ---------------------------------------------------------------------------
+# 用户实测：「使用过程中疯狂未响应」。根因是刷新定时器在 UI 线程上顺序探测
+# 约 21 个端口，而本机对一个**关闭**端口发起连接要等满 2 秒（SYN 被静默丢弃、
+# 不回 RST），一个刷新周期就是几十秒 —— 窗口自然一直「未响应」。
+# Windows 判定「未响应」的标准就是「窗口线程 5 秒内没取消息」，
+# 这里用 SendMessageTimeout(WM_NULL) 主动探活，把它变成可回归的断言。
+$probeReady = $false
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public class LauncherUiProbe {
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll", SetLastError=true)]
+  static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam,
+                                          uint flags, uint timeout, out IntPtr result);
+  delegate bool EnumProc(IntPtr h, IntPtr p);
+  const uint WM_NULL = 0x0000;
+  const uint SMTO_ABORTIFHUNG = 0x0002;
+  const uint SMTO_BLOCK = 0x0001;
+
+  public static IntPtr FindWindow(uint pid) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows((h, p) => {
+      uint owner; GetWindowThreadProcessId(h, out owner);
+      if (owner == pid) {
+        var t = new StringBuilder(256); GetWindowText(h, t, 256);
+        if (t.ToString() == "离线 RAG 文档问答") { found = h; return false; }
+      }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
+
+  public static List<string> Titles(uint target, out int visibleCount) {
+    var list = new List<string>();
+    int visible = 0;
+    EnumWindows((h, p) => {
+      uint pid; GetWindowThreadProcessId(h, out pid);
+      if (pid == target) {
+        var t = new StringBuilder(256); GetWindowText(h, t, 256);
+        if (t.Length > 0) list.Add(t.ToString());
+        if (IsWindowVisible(h)) visible++;
+      }
+      return true;
+    }, IntPtr.Zero);
+    visibleCount = visible;
+    return list;
+  }
+
+  // true = 有响应；false = 超过 timeout 没响应（UI 线程被占住）
+  public static bool Ping(IntPtr hWnd, uint timeoutMs, out uint elapsedMs) {
+    IntPtr result;
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    IntPtr ok = SendMessageTimeout(hWnd, WM_NULL, IntPtr.Zero, IntPtr.Zero,
+                                   SMTO_ABORTIFHUNG | SMTO_BLOCK, timeoutMs, out result);
+    sw.Stop();
+    elapsedMs = (uint)sw.ElapsedMilliseconds;
+    return ok != IntPtr.Zero;
+  }
+}
+'@ -Language CSharp
+    $probeReady = $true
+} catch {
+    Write-Host "  [INFO] Add-Type 不可用，跳过 UI 响应性采样：$($_.Exception.Message)" -ForegroundColor Gray
+}
+
+function Measure-Ui([int]$ProcessId, [int]$Seconds, [int]$ThresholdMs = 400) {
+    $hwnd = [IntPtr]::Zero
+    for ($i = 0; $i -lt 20; $i++) {
+        $hwnd = [LauncherUiProbe]::FindWindow([uint32]$ProcessId)
+        if ($hwnd -ne [IntPtr]::Zero) { break }
+        Start-Sleep -Milliseconds 300
+    }
+    if ($hwnd -eq [IntPtr]::Zero) {
+        return [pscustomobject]@{ WindowFound = $false; Samples = 0; Blocked = 0; MaxMs = 0 }
+    }
+
+    $samples = 0; $blocked = 0; $maxMs = 0
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt $Seconds) {
+        $elapsed = [uint32]0
+        $ok = [LauncherUiProbe]::Ping($hwnd, $ThresholdMs, [ref]$elapsed)
+        $samples++
+        if (-not $ok) { $blocked++ }
+        if ($elapsed -gt $maxMs) { $maxMs = $elapsed }
+        Start-Sleep -Milliseconds 250
+    }
+    return [pscustomobject]@{ WindowFound = $true; Samples = $samples; Blocked = $blocked; MaxMs = $maxMs }
+}
+
 Write-Host ('=' * 70)
 Write-Host '启动器验收（RAG-QA.exe）'
 Write-Host ('=' * 70)
@@ -162,47 +260,12 @@ $statusText = Invoke-Launcher @('--status')
 Check '--status 文本模式输出中文正常' ($statusText.StdOut -match '项目根目录') $statusText.StdOut.Split("`n")[0].Trim()
 
 # ---------------------------------------------------------------------------
-Section '3. GUI 面板冒烟（只开窗口，不自动启服务）'
+Section '3. GUI 面板冒烟 + UI 响应性（服务未运行时）'
 
 # 为什么不用 Process.MainWindowTitle：它只报告**可见**的主窗口。
 # 在无人交互的会话（CI、远程、沙箱）里窗口对象能建出来但不会真正显示，
 # MainWindowTitle 永远是空 —— 那会把「功能正常」误判成失败。
-# 这里直接枚举该进程的顶层窗口并检查标题文本，这才是界面真的建对了的证据。
-$probeReady = $false
-try {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Text;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-public class LauncherWindowProbe {
-  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
-  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-  [DllImport("user32.dll")] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
-  delegate bool EnumProc(IntPtr h, IntPtr p);
-  public static List<string> Titles(uint target, out int visibleCount) {
-    var list = new List<string>();
-    int visible = 0;
-    EnumWindows((h, p) => {
-      uint pid; GetWindowThreadProcessId(h, out pid);
-      if (pid == target) {
-        var t = new StringBuilder(256); GetWindowText(h, t, 256);
-        if (t.Length > 0) list.Add(t.ToString());
-        if (IsWindowVisible(h)) visible++;
-      }
-      return true;
-    }, IntPtr.Zero);
-    visibleCount = visible;
-    return list;
-  }
-}
-'@ -Language CSharp
-    $probeReady = $true
-} catch {
-    Write-Host "  [INFO] Add-Type 不可用，退回 MainWindowTitle 判断：$($_.Exception.Message)" -ForegroundColor Gray
-}
-
+# 这里直接枚举该进程的顶层窗口并检查标题文本（探针见文件开头的 Add-Type）。
 $gui = Start-Process -FilePath $Exe -PassThru
 $guiTitle = ''
 $visibleCount = 0
@@ -211,7 +274,7 @@ for ($i = 0; $i -lt 24; $i++) {
     $gui.Refresh()
     if ($gui.HasExited) { break }
     if ($probeReady) {
-        $titles = [LauncherWindowProbe]::Titles([uint32]$gui.Id, [ref]$visibleCount)
+        $titles = [LauncherUiProbe]::Titles([uint32]$gui.Id, [ref]$visibleCount)
         $match = $titles | Where-Object { $_ -eq '离线 RAG 文档问答' } | Select-Object -First 1
         if ($match) { $guiTitle = $match; break }
     } elseif ($gui.MainWindowTitle) {
@@ -223,6 +286,14 @@ Check '面板进程存活（没有构造异常直接崩）' (-not $gui.HasExited
 Check '面板窗口已创建且标题正确' ($guiTitle -eq '离线 RAG 文档问答') "title='$guiTitle'"
 if ($probeReady -and $guiTitle -and $visibleCount -eq 0) {
     Write-Host '  [INFO] 当前会话没有可见桌面：窗口对象已建立但不会显示（真实桌面下会正常弹出）' -ForegroundColor Gray
+}
+
+if ($probeReady -and -not $gui.HasExited) {
+    # 「服务未运行」是旧代码最糟的场景：完整端口扫描（21 个 × 2 秒连接超时）
+    Write-Host '  采样 UI 响应性（服务未运行，8 秒）...' -ForegroundColor Gray
+    $ui = Measure-Ui -ProcessId $gui.Id -Seconds 8 -ThresholdMs 400
+    Check 'UI 线程在服务未运行时保持响应' ($ui.Blocked -eq 0) (
+        "阻塞 $($ui.Blocked)/$($ui.Samples) 次，单次最长 $($ui.MaxMs)ms")
 }
 Stop-Process -Id $gui.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
@@ -250,6 +321,16 @@ Check '--status 报告运行中' ($runningJson -and $runningJson.running -eq $tr
 Check '报告的端口与启动端口一致' ($runningJson -and $runningJson.port -eq $targetPort) ("$($runningJson.port) vs $targetPort")
 Check '报告模型与知识库规模' ($runningJson -and $runningJson.model -and ($null -ne $runningJson.documents)) (
     "model=$($runningJson.model) docs=$($runningJson.documents) chunks=$($runningJson.chunks)")
+
+# 「使用中」场景：服务在跑、用户一边提问一边开着面板，UI 也必须保持响应
+if ($probeReady) {
+    $guiRunning = Start-Process -FilePath $Exe -PassThru
+    Write-Host '  采样 UI 响应性（服务运行中，6 秒）...' -ForegroundColor Gray
+    $ui2 = Measure-Ui -ProcessId $guiRunning.Id -Seconds 6 -ThresholdMs 400
+    Check 'UI 线程在服务运行时保持响应' ($ui2.WindowFound -and $ui2.Blocked -eq 0) (
+        "窗口=$($ui2.WindowFound) 阻塞 $($ui2.Blocked)/$($ui2.Samples) 次，最长 $($ui2.MaxMs)ms")
+    Stop-Process -Id $guiRunning.Id -Force -ErrorAction SilentlyContinue
+}
 
 $stop = Invoke-Launcher @('--stop', '--port', "$targetPort", '--keep-ollama')
 Check '--stop 退出码为 0' ($stop.ExitCode -eq 0) ("exit=$($stop.ExitCode)")
