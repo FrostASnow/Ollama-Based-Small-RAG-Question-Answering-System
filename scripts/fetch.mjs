@@ -1,18 +1,8 @@
 /**
  * 通用下载器（Node 内置模块，无第三方依赖）。
- *
- * 两种取源方式：
- *   1) 直接给 URL
- *        node scripts/fetch.mjs <url> <输出路径>
- *   2) 走 GitHub API 解析发布资源（当 github.com 被网络策略屏蔽、
- *      但 api.github.com / release-assets.githubusercontent.com 可用时非常有用）
- *        node scripts/fetch.mjs --github-asset <owner/repo> <tag> <资源名> <输出路径>
- *
- * 通用选项：
- *   --sha256 <期望值>   下载后校验（续传时重新读盘计算，保证可信）
- *   --header "K: V"     追加请求头，可重复
- *
- * 支持断点续传：中断后重跑会从 .part 文件已下载的字节继续。
+ * 用法：node scripts/fetch.mjs <url> <输出路径>
+ *  或：node scripts/fetch.mjs --github-asset <owner/repo> <tag> <资源名> <输出路径>
+ * 选项：--sha256 <值>（下载后校验）、--header "K: V"；支持从 .part 断点续传。
  */
 
 import { createWriteStream, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
@@ -23,12 +13,9 @@ import { dirname, resolve } from 'node:path';
 
 const USER_AGENT = 'rag-qa-setup';
 
-// 进度输出策略（踩过的坑）：
-// PowerShell 5.1 会**按行**转发原生命令的输出 —— 只有 \r 没有 \n 的内容会被
-// 一直攒在缓冲区里，直到进程退出才落盘。于是一次 1.4GB 的下载在安装日志里
-// 全程「一片空白」，用户完全看不出它是在下载还是卡死了。
-// 所以在非交互场景下改用「\n 结尾的整行进度」（每 5 秒一行），
-// 交互式终端下才保留原地刷新的 \r 效果。
+// 进度输出策略：PowerShell 5.1 按行转发原生命令输出，只有 \r 没有 \n 的内容会一直
+// 攒在缓冲区里直到进程退出才落盘（安装日志里全程一片空白）。所以非交互场景改用
+// \n 结尾的整行进度，交互式终端才保留原地刷新的 \r 效果。
 const IS_TTY = process.stdout.isTTY === true;
 const PROGRESS_INTERVAL_MS = IS_TTY ? 800 : 5000;
 
@@ -76,8 +63,7 @@ function parseArgs(argv) {
 
 /** 通过 GitHub API 把 (仓库, 版本, 资源名) 解析成可直接下载的签名地址。 */
 async function resolveGithubAsset({ repo, tag, name }) {
-  // tag 为 latest 时必须用 /releases/latest：
-  // /releases/tags/latest 会 404 —— 并不存在一个名叫 "latest" 的标签。
+  // tag 为 latest 时必须走 /releases/latest：/releases/tags/latest 会 404。
   const api = tag === 'latest'
     ? `https://api.github.com/repos/${repo}/releases/latest`
     : `https://api.github.com/repos/${repo}/releases/tags/${tag}`;

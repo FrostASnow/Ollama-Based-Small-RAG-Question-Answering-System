@@ -1,17 +1,7 @@
 /**
- * 前端测试（Node 直接运行，无需浏览器）。
- *
- * 分两部分：
- *   1. 渲染逻辑 —— markdown.js 的 HTML 转义（唯一的安全边界）、语法、引用角标
- *   2. 静态一致性 —— app.js 引用的 DOM id / api.js 导出是否都真实存在
- *
- * 第 2 部分能抓住最常见的两类低级错误：
- *   * `$('setupMute')` 与 `id="setupMute"` 拼写不一致 → 运行时 null 报错
- *   * 重命名了 api.js 的导出但忘了改 import → 模块加载即失败
- * 这类问题靠手点页面很难覆盖全，静态检查反而更彻底。
- *
- * 用法：
- *   node tests/test_frontend.mjs
+ * 前端测试（Node 直接运行，无需浏览器）：markdown.js 的渲染/转义，以及
+ * app.js 引用的 DOM id、api.js/markdown.js 的导出是否真实存在。
+ * 后者能挡住「$('x') 与 id="x" 拼写不一致」「重命名导出忘了改 import」这类低级错误。
  */
 
 import { readFile } from 'node:fs/promises';
@@ -22,8 +12,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 const jsDir = join(root, 'frontend', 'assets', 'js');
 
-// markdown.js 没有依赖，用 data URL 直接加载，
-// 避免为了 import 一个 .js 而在前端目录塞 package.json
+// markdown.js 没有依赖，用 data URL 直接加载，省得为 import 一个 .js 在前端目录塞 package.json
 const markdownSource = await readFile(join(jsDir, 'markdown.js'), 'utf8');
 const mod = await import(`data:text/javascript;base64,${Buffer.from(markdownSource).toString('base64')}`);
 const { renderMarkdown, escapeHtml, renderPlain } = mod;
@@ -140,11 +129,8 @@ check('renderPlain 也做转义', !renderPlain('<script>x</script>').includes('<
 /* ================================================================== */
 section('4b. 列表渲染（用户实测：分点全都显示成「1.」）');
 
-// 真实故障：deepseek-r1:1.5b 的输出形如
-//     1. **特征提取的普适性**  （行尾两空格）
-//        多任务网络通过共享特征提取器……
-// 旧渲染器把缩进的说明行当成普通段落 → 列表被段落切断 → 每个要点各自成为
-// 一个只有一项的 <ol>，浏览器于是把**每一条**都编号成 1。
+// 旧渲染器把缩进的说明行当成普通段落 → 列表被段落切断，每个要点各自成为一个
+// 只有一项的 <ol>，浏览器把每一条都编号成 1。
 const modelOutput = [
   '多任务网络的优势主要体现在以下几个方面：',
   '',
@@ -284,10 +270,8 @@ section('6. hidden 属性兜底（曾导致弹窗关不掉）');
 
 const css = await readFile(join(root, 'frontend', 'assets', 'css', 'style.css'), 'utf8');
 
-// 浏览器默认的 [hidden] { display: none } 特异性只有 0-1-0。
-// 任何类选择器里写了 display（.modal 是 grid、.sources 是 flex……）
-// 都会把它盖掉，于是 el.xxx.hidden = true 完全没有视觉效果 ——
-// 表现就是「按钮点了没反应」，实际上是弹窗根本没关。
+// 浏览器默认的 [hidden] { display: none } 特异性只有 0-1-0，任何类选择器里写了
+// display 都会把它盖掉 —— 表现成「按钮点了没反应」，其实是弹窗根本没关。
 check('[hidden] 兜底规则存在',
   /\[hidden\]\s*\{\s*display:\s*none\s*!important/.test(css),
   '缺少这条规则时，带 display 的元素无法被 hidden 隐藏');
@@ -307,10 +291,8 @@ for (const cls of conflicting) {
 
 /* ================================================================== */
 section('7. 环境面板与后端探测字段一致');
-// 真实故障：便携版 Ollama 只装了一半（只有 ollama.exe，缺 lib\ollama 下的
-// 推理引擎）。此时服务能启动、模型也能列出，但一提问就报
-// llama-server binary not found。如果面板只看「文件在不在」就写「已就绪」，
-// 就会和下面的问题卡片自相矛盾，用户根本不知道该信哪个。
+// 便携版 Ollama 只装了一半时服务能起、模型也能列出，但一提问就报
+// llama-server binary not found；面板只看「文件在不在」会和问题卡片自相矛盾。
 check('app.js 消费后端的 ollama_portable 探测结果',
   /environment\.ollama_portable/.test(appSrc));
 check('Ollama 行区分出「不完整」这第三种状态',
@@ -325,7 +307,7 @@ check('徽标支持自定义文案（不完整 / 缺失 / 已就绪）',
 /* ================================================================== */
 section('8. 检索策略徽标与重建索引入口');
 
-// 后端会把「这轮用的是概览检索」和「阈值内没命中、已自动放宽」下发到 meta 事件。
+// 后端把「这轮用概览检索」和「阈值内没命中、已自动放宽」下发到 meta 事件，
 // 界面必须显式告诉用户，否则他会把概览结果当成普通问答结果。
 check('app.js 消费 meta.mode', /data\.mode\s*===\s*'overview'/.test(appSrc));
 check('app.js 消费 meta.relaxed', /data\.relaxed/.test(appSrc));

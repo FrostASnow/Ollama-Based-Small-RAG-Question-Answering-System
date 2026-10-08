@@ -1,11 +1,7 @@
-"""Ollama 集成测试：用协议兼容的假服务验证真实调用链路。
-
-与 `test_e2e.py` 的区别：
-    test_e2e.py 直接把 LLM 换成 Python 假对象，验证的是 RAG 业务逻辑；
-    本测试保留 **真实的 ChatOllama + ollama 客户端 + HTTP**，
-    只把 Ollama 服务端换成协议兼容的实现，验证的是集成层：
-        请求是否正确发出、流式 NDJSON 是否正确解析、
-        message.thinking 字段是否被识别、错误分支是否可读。
+"""Ollama 集成测试：用协议兼容的假服务验证真实调用链路。与 `test_e2e.py` 的区别：
+那边把 LLM 换成 Python 假对象验证 RAG 业务逻辑，本测试保留真实的 ChatOllama +
+ollama 客户端 + HTTP，只换服务端，验证请求是否正确发出、流式 NDJSON 是否正确解析、
+错误分支是否可读。
 
     .venv\\Scripts\\python.exe tests\\test_ollama_integration.py
 """
@@ -116,9 +112,8 @@ async def main() -> int:
 
         # ------------------------------------------------------------------
         section("1b. 原生 thinking 通道能力探测")
-        # deepseek-r1 这类模型由 Ollama 走**原生 thinking 通道**：思维链不在
-        # content 里，而在 message.thinking → langchain 的 reasoning_content。
-        # 不开这个通道，用户点发送后会长时间看不到任何输出。
+        # 防「点了发送后长时间没有任何输出」：deepseek-r1 的思维链不在 content 里，
+        # 而在 message.thinking → langchain 的 reasoning_content。
         ollama_client.invalidate_capability_cache()
         check("识别出模型支持 thinking",
               ollama_client.supports_thinking(MODEL_NAME) is True)
@@ -142,6 +137,40 @@ async def main() -> int:
         rag.reset_llm()
 
         # ------------------------------------------------------------------
+        section("1b-2. 能力缓存的失效时机（issues #6）")
+        # 防「刚 pull 好的模型被按旧结论对待」：以前缓存最长 5 分钟不失效
+        _Handler.capabilities = ["completion", "thinking"]
+        ollama_client.invalidate_capability_cache()
+        check("支持 thinking 的模型被识别", ollama_client.supports_thinking(MODEL_NAME) is True)
+        check("结果进了缓存", bool(ollama_client._capability_cache))
+
+        # 服务端悄悄变了（等价于用户 pull 了新版本），但缓存还在 → 仍按旧结论
+        _Handler.capabilities = ["completion"]
+        check("缓存期内沿用旧结论（这是缓存的本意，不是 bug）",
+              ollama_client.supports_thinking(MODEL_NAME) is True)
+
+        ollama_client.invalidate_capability_cache()
+        check("主动失效后立刻取到新结论",
+              ollama_client.supports_thinking(MODEL_NAME) is False)
+
+        check("兜底 TTL 不超过 60 秒",
+              ollama_client.CAPABILITY_TTL_SECONDS <= 60.0,
+              f"{ollama_client.CAPABILITY_TTL_SECONDS}s")
+
+        ollama_client.invalidate_cache()
+        ollama_client._capability_cache["sentinel"] = (0.0, False)
+        _Handler.capabilities = ["completion", "tools", "thinking"]
+        report = await ollama_client.probe()
+        check("invalidate_cache 只管可达性缓存（不动能力缓存）",
+              ollama_client._capability_cache.get("sentinel") is not None)
+        ollama_client.invalidate_all()
+        check("invalidate_all 两个缓存一起清",
+              not ollama_client._capability_cache and ollama_client._cache["at"] == 0.0)
+        check("探测仍然可用（假服务可达）", report[0] is True and MODEL_NAME in report[1])
+
+        rag.reset_llm()
+
+        # ------------------------------------------------------------------
         section("1c. 模型预热（/api/generate 空 prompt）")
         # Ollama 懒加载：不预热的话第一条提问要等权重载入显存（实测约 100 秒）
         check("预热调用成功", await ollama_client.warmup_model(MODEL_NAME) is True)
@@ -153,8 +182,7 @@ async def main() -> int:
 
         # ------------------------------------------------------------------
         section("1d. 退出时卸载模型（keep_alive=0）")
-        # 程序退出后不该继续占着显存：即使 Ollama 进程被保留（-KeepOllama），
-        # 也要通过 keep_alive=0 让它把模型卸掉。
+        # 程序退出后不该继续占着显存，即使 Ollama 进程被保留也要卸掉模型
         check("卸载调用成功", await ollama_client.unload_model(MODEL_NAME) is True)
         check("卸载请求带 keep_alive=0",
               (_Handler.last_generate_payload or {}).get("keep_alive") == 0,
@@ -219,9 +247,8 @@ async def main() -> int:
         check("health 报告 Ollama 可达", health.ollama_reachable is True)
         check("health 报告模型可用", health.llm_model_available is True)
 
-        # 这里刻意不断言 status == "ok"：假服务本身没问题，但**环境**可能带着
-        # 真实缺陷（例如项目内置的便携版 Ollama 解压不完整、嵌入模型没下），
-        # 那时 degraded 才是正确答案。断言「状态与 problems 自洽」更有意义。
+        # 这里刻意不断言 status == "ok"：假服务没问题，但**环境**可能带着真实缺陷
+        # （例如便携版 Ollama 解压不完整、嵌入模型没下），那时 degraded 才对。
         problems = list(health.detail.get("problems", []))
         check("health 未报告与假服务有关的缺陷",
               not any("服务未启动" in p or "未找到模型" in p for p in problems), str(problems))

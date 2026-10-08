@@ -1,0 +1,6 @@
+{
+  "name": "rag-qa-frontend",
+  "private": true,
+  "type": "module",
+  "description": "标记目录内的 .js 为 ES Module。前端本身是免构建的（浏览器按 <script type=\"module\"> 直接加载），这个文件只给 Node 用：tests/test_frontend_interaction.mjs 需要在真实 DOM 垫片里 import app.js，而 Node 对 .js 的默认解析是 CommonJS。浏览器不会请求它。"
+}

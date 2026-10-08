@@ -1,12 +1,5 @@
-"""FAISS 向量库管理。
-
-* 使用 ``IndexFlatIP``（内积）作为距离度量。
-* **归一化在 Embeddings 层完成**（``encode_kwargs={"normalize_embeddings": True}``），
-  因此内积等价于余弦相似度，分数落在 [-1, 1]，越高越相关。
-  这里刻意不传 ``normalize_L2=True``：langchain 在 ``MAX_INNER_PRODUCT``
-  下会忽略该参数并打印告警，属于误导性配置。
-* 索引与 docstore 持久化在 ``data/index/``，重启服务自动恢复。
-* 所有写操作加锁，读操作无锁（FAISS 查询本身线程安全）。
+"""FAISS 向量库管理：``IndexFlatIP``、持久化在 ``data/index/``、写操作加锁。
+归一化已在 Embeddings 层完成，内积即余弦相似度，不要传 ``normalize_L2=True``。
 """
 
 from __future__ import annotations
@@ -15,7 +8,7 @@ import re
 import shutil
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from langchain_core.documents import Document
 
@@ -23,15 +16,29 @@ from app.config import settings
 from app.core.logging import get_logger
 from app.core.paths import FAISS_INDEX_NAME, INDEX_DIR
 from app.schemas import SourceChunk
-from app.services.embeddings import get_embeddings
+from app.services import index_health
+from app.services.embeddings import get_embeddings, loaded_dimension
+from app.services.registry import registry
 
 logger = get_logger(__name__)
 
-# 近重复检测用的字符 n-gram 长度。中文没有空格分词，按 4 字滑窗做「集合指纹」
-# 比按词更稳，而且完全不需要分词库。
+# 近重复检测用的字符 n-gram 长度：中文没有空格分词，按 4 字滑窗做「集合指纹」
+# 比按词更稳，也不需要分词库。
 _SHINGLE_SIZE = 4
-# 候选池上限：去重是 O(n^2) 的集合比较，池子必须有界，否则单次提问会被拖慢
+# 候选池上限：去重是 O(n^2) 集合比较，池子必须有界
 _MAX_CANDIDATES = 120
+
+
+class IndexIncompatibleError(RuntimeError):
+    """索引与当前嵌入配置不兼容（换过模型 / 维度），只能重建索引。"""
+
+
+class _Entry(NamedTuple):
+    """枚举索引时的一条片段；带 ``vector_id`` 是为了之后按需取分数（``reconstruct``）。"""
+
+    vector_id: int
+    docstore_id: str
+    doc: Document
 
 
 class VectorStoreManager:
@@ -81,6 +88,42 @@ class VectorStoreManager:
         return self._store if self._store is not None else self.load()
 
     # ------------------------------------------------------------------
+    # 一致性体检
+    # ------------------------------------------------------------------
+    @property
+    def dimension(self) -> int | None:
+        """已载入索引实际的向量维度（未载入时为 None）。"""
+        if self._store is None:
+            return None
+        try:
+            return int(self._store.index.d)
+        except Exception:  # noqa: BLE001 - 索引类型异常时按「不知道」处理
+            return None
+
+    def compatibility(self) -> dict[str, Any]:
+        """索引与当前嵌入 / 切分 / 解析配置是否还对得上。"""
+        return index_health.check(
+            has_index=self.ready or self.exists_on_disk(),
+            index_dimension=self.dimension,
+            model_dimension=loaded_dimension(),
+            meta=registry.get_index_meta(),
+        )
+
+    def raise_if_incompatible(self) -> None:
+        """不一致就抛出**能照做**的中文错误，而不是让 FAISS 抛断言；必须在 ensure_loaded() 之后调用。"""
+        report = self.compatibility()
+        if report["compatible"]:
+            return
+        raise IndexIncompatibleError(
+            "知识库索引与当前的嵌入配置不一致，检索无法继续：\n- "
+            + "\n- ".join(report["reasons"])
+            + "\n请在左侧点击「重建索引」用当前模型重新生成向量"
+            "（原始文件都在 data/uploads 里，重建不会丢文档）。"
+            "若刚改过 RAG_EMBEDDING_MODEL_NAME / RAG_EMBEDDING_DIMENSION，"
+            "改回原值也可以立即恢复。"
+        )
+
+    # ------------------------------------------------------------------
     # 写操作
     # ------------------------------------------------------------------
     def add_chunks(self, chunks: list[Document]) -> list[str]:
@@ -92,7 +135,15 @@ class VectorStoreManager:
 
         with self._lock:
             embeddings = get_embeddings()
-            if self._store is None:
+
+            # 先尝试把磁盘索引载入内存，**不能**因为内存里没有就从零建库：那会把已有
+            # 文档的向量全部丢掉（持久化时直接覆盖 .faiss/.pkl），而注册表里那些文档还在。
+            store = self.ensure_loaded()
+            if store is not None:
+                # 往旧向量空间里追加新模型的向量，只会得到一个混合的坏索引
+                self.raise_if_incompatible()
+
+            if store is None:
                 self._store = FAISS.from_documents(
                     documents=chunks,
                     embedding=embeddings,
@@ -107,10 +158,8 @@ class VectorStoreManager:
             return list(ids)
 
     def delete_ids(self, ids: list[str]) -> int:
-        """按 chunk id 删除向量；返回实际删除数量。
-
-        会先过滤掉索引里已不存在的 id：注册表与索引可能因异常中断而不一致，
-        直接把不存在的 id 交给 FAISS 会抛错，导致整批删除失败（连带删掉正常的部分）。
+        """按 chunk id 删除向量；返回实际删除数量。先过滤掉索引里已不存在的 id：
+        注册表与索引可能不一致，把不存在的 id 交给 FAISS 会抛错，整批删除都会失败。
         """
         if not ids:
             return 0
@@ -148,6 +197,12 @@ class VectorStoreManager:
     def persist(self) -> None:
         with self._lock:
             self.persist_locked()
+
+    def drop_memory(self) -> None:
+        """丢掉内存里的索引（**不动磁盘文件**）；换嵌入模型/设备后调用，否则会继续用旧模型。"""
+        with self._lock:
+            self._store = None
+        logger.info("内存索引已丢弃，下次使用时按当前配置重新载入")
 
     def reset(self) -> None:
         """清空内存索引并删除磁盘文件。"""
@@ -194,22 +249,7 @@ class VectorStoreManager:
         score_threshold: float | None = None,
         doc_ids: list[str] | None = None,
     ) -> tuple[list[SourceChunk], dict[str, Any]]:
-        """检索并返回诊断信息 ``(片段, info)``。
-
-        相比单纯的「分数 < 阈值就丢弃」，这里做了三件事：
-
-        1. **相对窗口裁剪**：只保留与最佳片段相差不超过 ``score_window`` 的候选。
-           all-MiniLM-L6-v2 的分数分布很扁，无关内容也能到 0.25，
-           单靠绝对阈值区分不了「都相关」与「一片噪声」。
-        2. **近重复去重**：期刊 PDF 的页眉会被切进多个 chunk，
-           它们彼此几乎一样，只会白占 top_k 的槽位。
-        3. **兜底放宽**：阈值内一条都没有时，退到 ``max(score_floor, 最佳-窗口)``
-           再试一次，并把 ``relaxed`` 标出来给界面提示。
-           否则「总结一下」这类问法（最佳仅 0.27）会直接被判成「无法回答」。
-
-        ``score_threshold <= 0`` 表示调用方明确要求「不要过滤」，此时不做窗口裁剪，
-        也不放宽（没有意义）。
-        """
+        """检索并返回诊断信息 ``(片段, info)``；含窗口裁剪、去重与兜底放宽（标记 ``relaxed``）。"""
         store = self.ensure_loaded()
         info: dict[str, Any] = {
             "mode": "qa",
@@ -222,6 +262,8 @@ class VectorStoreManager:
         }
         if store is None or self.size == 0:
             return [], info
+        # 载入索引时模型已经在内存里，此刻的一致性判断是硬的
+        self.raise_if_incompatible()
 
         k = top_k or settings.top_k
         threshold = settings.score_threshold if score_threshold is None else score_threshold
@@ -305,12 +347,7 @@ class VectorStoreManager:
         max_chars: int | None = None,
     ) -> tuple[list[SourceChunk], dict[str, Any]]:
         """为「总结 / 概述」类问题按全篇均匀取样，而不是按相似度取 top-k。
-
-        这类问题问的是整篇文档的要点，和任何一个片段都不相似（实测中文短问句
-        「总结一下」的最佳相似度只有 0.27，比随机噪声高不了多少），
-        用阈值筛必然漏。既然文档已经确定，就直接把全篇摊开给模型看：
-        按阅读顺序均匀取 ``summary_max_chunks`` 段，先去掉近重复的页眉副本，
-        再按 ``max_context_chars`` 的预算装箱。
+        这类问题与任何单个片段都不相似（「总结一下」最佳仅 0.27），用阈值筛必然漏掉全文。
         """
         store = self.ensure_loaded()
         info: dict[str, Any] = {
@@ -326,6 +363,8 @@ class VectorStoreManager:
         if store is None or self.size == 0:
             return [], info
 
+        self.raise_if_incompatible()
+
         wanted = set(doc_ids) if doc_ids else None
         entries = self._ordered_entries(wanted)
         info["candidates"] = len(entries)
@@ -340,13 +379,12 @@ class VectorStoreManager:
         if want <= 0:
             return [], info
 
-        # 按文档分组取样：「用三句话总结这些文档」时，如果把所有块拉平后
-        # 按长度均匀取样，一篇 131 块的论文会把 11 块的小文档整个挤掉 ——
-        # 总结里就只剩长的这篇。所以先给每篇文档保底名额，再按块数分剩余额度。
-        groups: list[list[tuple[str, Document]]] = []
+        # 按文档分组取样：把所有块拉平后按长度均匀取样的话，一篇 131 块的论文会把 11 块
+        # 的小文档整个挤掉，总结里就只剩长的那篇。所以先给每篇保底名额，再按块数分余额。
+        groups: list[list[_Entry]] = []
         position_of: dict[str, int] = {}
         for entry in unique:
-            doc_id = str((entry[1].metadata or {}).get("doc_id", ""))
+            doc_id = str((entry.doc.metadata or {}).get("doc_id", ""))
             if doc_id not in position_of:
                 position_of[doc_id] = len(groups)
                 groups.append([])
@@ -357,42 +395,50 @@ class VectorStoreManager:
         info["quotas"] = dict(
             zip(
                 (
-                    str((group[0][1].metadata or {}).get("filename", "?"))
+                    str((group[0].doc.metadata or {}).get("filename", "?"))
                     for group in groups
                 ),
                 quotas,
             )
         )
 
+        # 先按名额取出要用的片段，再只给**这几个**片段算分：以前反过来先给全库每段算分
+        # （两次 O(n) 扫描），其中 99% 的分数算完就被丢掉。
+        picked: list[tuple[_Entry, str]] = []
+        for group, quota in zip(groups, quotas):
+            for entry in _evenly_pick(group, quota):
+                body = entry.doc.page_content.strip()
+                if body:
+                    picked.append((entry, body))
+
         scores: dict[str, float] = {}
-        if query:
+        if query and picked:
             try:
-                scores = self._score_map(get_embeddings().embed_query(query))
+                scores = self._score_map(
+                    get_embeddings().embed_query(query), [entry for entry, _ in picked]
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("概览取样打分失败（不影响取样）：%s", exc)
 
         results: list[SourceChunk] = []
         used = 0
-        for group, quota in zip(groups, quotas):
-            for docstore_id, doc in _evenly_pick(group, quota):
-                body = doc.page_content.strip()
-                if not body:
-                    continue
-                if results and used + len(body) > budget:
-                    continue
-                meta = doc.metadata or {}
-                results.append(
-                    SourceChunk(
-                        index=len(results) + 1,
-                        doc_id=str(meta.get("doc_id", "")),
-                        filename=str(meta.get("filename", "未知文档")),
-                        page=meta.get("page"),
-                        chunk_index=meta.get("chunk_index"),
-                        score=round(scores.get(docstore_id, 0.0), 4),
-                        content=body,
-                    )
+        for entry, body in picked:
+            # 第一段无论如何都要放进去，否则预算算错时会给出一份空上下文
+            if results and used + len(body) > budget:
+                continue
+            meta = entry.doc.metadata or {}
+            results.append(
+                SourceChunk(
+                    index=len(results) + 1,
+                    doc_id=str(meta.get("doc_id", "")),
+                    filename=str(meta.get("filename", "未知文档")),
+                    page=meta.get("page"),
+                    chunk_index=meta.get("chunk_index"),
+                    score=round(scores.get(entry.docstore_id, 0.0), 4),
+                    content=body,
                 )
-                used += len(body)
+            )
+            used += len(body)
 
         if results:
             info["best_score"] = round(max(item.score for item in results), 4)
@@ -402,12 +448,12 @@ class VectorStoreManager:
     # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
-    def _ordered_entries(self, wanted: set[str] | None) -> list[tuple[str, Document]]:
+    def _ordered_entries(self, wanted: set[str] | None) -> list[_Entry]:
         """按索引写入顺序（≈ 文档阅读顺序）列出所有片段。"""
         store = self.ensure_loaded()
         if store is None:
             return []
-        entries: list[tuple[str, Document]] = []
+        entries: list[_Entry] = []
         for vector_id in sorted(store.index_to_docstore_id):
             docstore_id = store.index_to_docstore_id[vector_id]
             try:
@@ -419,35 +465,45 @@ class VectorStoreManager:
             meta = doc.metadata or {}
             if wanted is not None and meta.get("doc_id") not in wanted:
                 continue
-            entries.append((docstore_id, doc))
+            entries.append(_Entry(int(vector_id), docstore_id, doc))
         return entries
 
-    def _score_map(self, query_vector: list[float]) -> dict[str, float]:
-        """返回 ``docstore_id -> 余弦相似度``（用于概览取样时补齐真实分数）。"""
+    def _score_map(self, query_vector: list[float], entries: list[_Entry]) -> dict[str, float]:
+        """只给 ``entries`` 里这几条片段算余弦分数，返回 ``docstore_id -> score``；用 O(d) 的
+        ``reconstruct`` 而非 O(n·d) 的全量 ``index.search``。
+        """
         import numpy as np
 
         store = self.ensure_loaded()
-        if store is None or self.size == 0:
+        if store is None or self.size == 0 or not entries:
             return {}
-        vector = np.asarray(query_vector, dtype="float32").reshape(1, -1)
-        scores, indices = store.index.search(vector, self.size)
-        mapping: dict[str, float] = {}
+
+        query = np.asarray(query_vector, dtype="float32").reshape(-1)
+
+        if hasattr(store.index, "reconstruct"):
+            mapping: dict[str, float] = {}
+            for entry in entries:
+                try:
+                    row = store.index.reconstruct(entry.vector_id)
+                except Exception as exc:  # noqa: BLE001 - 个别 id 取不到就跳过
+                    logger.debug("reconstruct 失败（跳过该片段）：%s", exc)
+                    continue
+                mapping[entry.docstore_id] = float(np.dot(np.asarray(row, dtype="float32"), query))
+            if mapping:
+                return mapping
+            # 一条都没取到：与其给出一片 0 分，不如退回全量扫描
+            logger.debug("reconstruct 未取到任何向量，退回全量扫描打分")
+
+        scores, indices = store.index.search(query.reshape(1, -1), self.size)
+        fallback: dict[str, float] = {}
         for score, index in zip(scores[0], indices[0]):
             key = int(index)
             if key < 0:
                 continue
             docstore_id = store.index_to_docstore_id.get(key)
             if docstore_id is not None:
-                mapping[docstore_id] = float(score)
-        return mapping
-
-    def search_documents(self, query: str, k: int = 8) -> list[tuple[Document, float]]:
-        """返回原始 (Document, score)，供调试接口使用。"""
-        store = self.ensure_loaded()
-        if store is None or self.size == 0:
-            return []
-        query_vector = get_embeddings().embed_query(query)
-        return store.similarity_search_with_score_by_vector(query_vector, k=min(self.size, k))
+                fallback[docstore_id] = float(score)
+        return fallback
 
     def chunks_of(self, doc_id: str, limit: int = 50) -> list[dict[str, Any]]:
         """列出某个文档已索引的分块（按 chunk_index 排序），用于核对切分质量。"""
@@ -504,9 +560,9 @@ vector_store = VectorStoreManager()
 # ---------------------------------------------------------------------------
 # 近重复片段去重
 # ---------------------------------------------------------------------------
-# 期刊 PDF 的页眉会被切进多个 chunk（每页一份副本），它们对任何提问的相似度
-# 都不低，于是 top_k 里塞进好几条一模一样的样板文本，正文反而进不来。
-# 这里用字符 4-gram 集合的 Jaccard 相似度判断「几乎是同一段话」。
+# 期刊 PDF 的页眉会被切进多个 chunk（每页一份副本），它们对任何提问的相似度都不低，
+# top_k 里于是塞进好几条一样的样板文本。这里用字符 4-gram 集合的 Jaccard 相似度判断
+# 「几乎是同一段话」。
 def _shingles(text: str, size: int = _SHINGLE_SIZE) -> frozenset[str]:
     compact = re.sub(r"\s+", "", text)
     if not compact:
@@ -527,7 +583,7 @@ def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
 
 def _near_duplicate(signal: frozenset[str], length: int, priors: list[tuple[frozenset[str], int]], ratio: float) -> bool:
     for prior, prior_length in priors:
-        # 长度差太多的两段话不可能是副本，先做廉价剪枝
+        # 长度差太多的两段话不可能是副本：廉价剪枝
         if length and prior_length:
             shorter, longer = sorted((length, prior_length))
             if shorter / longer < ratio:
@@ -557,29 +613,25 @@ def _dedupe_pairs(
     return kept, dropped
 
 
-def _dedupe_entries(
-    entries: list[tuple[str, Document]], ratio: float
-) -> tuple[list[tuple[str, Document]], int]:
-    """同上，但作用于 ``(docstore_id, Document)`` 且保持原顺序。"""
+def _dedupe_entries(entries: list[_Entry], ratio: float) -> tuple[list[_Entry], int]:
+    """同上，但作用于 ``_Entry``（保留 vector_id / docstore_id）且保持原顺序。"""
     if ratio <= 0:
         return entries, 0
-    kept: list[tuple[str, Document]] = []
+    kept: list[_Entry] = []
     priors: list[tuple[frozenset[str], int]] = []
     dropped = 0
-    for docstore_id, doc in entries:
-        text = doc.page_content or ""
+    for entry in entries:
+        text = entry.doc.page_content or ""
         signal = _shingles(text)
         if _near_duplicate(signal, len(text), priors, ratio):
             dropped += 1
             continue
-        kept.append((docstore_id, doc))
+        kept.append(entry)
         priors.append((signal, len(text)))
     return kept, dropped
 
 
-def _evenly_pick(
-    items: list[tuple[str, Document]], quota: int
-) -> list[tuple[str, Document]]:
+def _evenly_pick(items: list[Any], quota: int) -> list[Any]:
     """在保持顺序的前提下均匀取 ``quota`` 条（首尾必取）。"""
     if quota <= 0 or not items:
         return []
@@ -593,10 +645,7 @@ def _evenly_pick(
 
 def _allocate_quotas(sizes: list[int], budget: int) -> list[int]:
     """把 ``budget`` 个取样名额分配到若干文档上。
-
-    规则：先留出一半名额在所有文档间平均分配（每篇至少 1 块），
-    剩下的按各文档的块数比例分配，并保证不超过该文档实际块数。
-    这样「总结这些文档」既能覆盖到短文档，又会给长文档更多篇幅。
+    先留一半名额平均分配（每篇至少 1 块），剩下的按块数比例分配，避免短文档被挤掉。
     """
     count = len(sizes)
     if count == 0 or budget <= 0:

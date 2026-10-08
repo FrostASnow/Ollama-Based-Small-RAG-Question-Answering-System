@@ -1,12 +1,7 @@
 """RAG 核心：检索 → 组装提示词 → 调用本地 Ollama 生成（支持流式）。
 
-针对 **1.5B 小模型** 做了几处工程化处理：
-1. 上下文严格裁剪（``max_context_chars``），避免超出 ``num_ctx`` 导致截断或幻觉。
-2. 提示词强约束「只依据资料作答、无依据则明确说不知道」，抑制小模型编造。
-3. 要求用 ``[n]`` 标注来源，前端可点击溯源到原文分块。
-4. ``deepseek-r1`` 的推理链被单独解析成 ``thinking`` 事件，
-   既能让用户看到推理过程，又不会污染正文和引用编号。
-"""
+针对 1.5B 小模型：裁剪上下文避免超出 ``num_ctx`` 被截断；提示词强约束只依据资料
+作答并标注 ``[n]`` 来源；``deepseek-r1`` 的推理链单独解析为 ``thinking`` 事件。"""
 
 from __future__ import annotations
 
@@ -32,13 +27,11 @@ _llm: Any | None = None
 # ---------------------------------------------------------------------------
 # 推理链标签
 # ---------------------------------------------------------------------------
-# 注意：这里刻意用 chr() 拼接，而不是写字面量。
-# deepseek-r1 的推理链标签属于分词器特殊 token，直接以字面量写入源码
-# 会在部分工具链中被改写成语义等价但无法匹配的字符，导致解析静默失效。
-# ---------------------------------------------------------------------------
-_LT = chr(60)  # <
-_GT = chr(62)  # >
-_SLASH = chr(47)  # /
+# 刻意用 chr() 拼接而非写字面量：推理链标签属于分词器特殊 token，以字面量写进源码
+# 可能在部分工具链中被改写成无法匹配的字符，导致解析静默失效。
+_LT = chr(60)
+_GT = chr(62)
+_SLASH = chr(47)
 _THINK_WORD = "think"
 
 THINK_OPEN = _LT + _THINK_WORD + _GT
@@ -66,12 +59,8 @@ SYSTEM_PROMPT = """你是一个严谨的文档问答助手。你必须**只依�
 再次强调：回答里每一句涉及文档内容的话，句末都必须带上来源编号（如 [1]）；整段话都没有编号的回答不合格。
 """
 
-# 概览 / 总结类问题专用的提示词。
-#
-# 为什么不能和普通问答共用一套提示词：概览模式喂进去的是**全篇均匀取样的片段**，
-# 而不是「最相关的几段」。这时如果还写「只回答用户问的那一点」，模型会抓住
-# 某一段细节展开，总结就退化成片段复述；同时必须显式要求合并重复内容 ——
-# 取样片段来自不同章节，会有交叉重复。
+# 概览模式喂进去的是全篇均匀取样的片段，而非「最相关的几段」：共用普通问答提示词会让
+# 模型抓住某段细节展开、退化成片段复述；取样片段跨章节有交叉重复，必须显式要求合并。
 OVERVIEW_PROMPT = """你是一个严谨的文档总结助手。【文档片段】是同一篇（或同一批）文档按阅读顺序均匀抽取的内容，用来让你把握整体。
 
 请严格按下面的格式作答，不要增减小节、不要写开场白：
@@ -107,13 +96,8 @@ NO_CONTEXT_REPLY = (
 # ---------------------------------------------------------------------------
 # 提问意图：普通问答 vs 全文概览
 # ---------------------------------------------------------------------------
-# 「总结 / 概述 / 讲了什么」问的是**整篇**，与任何一个片段都不相似。
-# 实测（data 里的 4 页中文期刊论文 + all-MiniLM-L6-v2）：
-#     「多任务网络的优势是什么」 最佳相似度 0.367
-#     「请总结这篇文档的主要内容」 0.433（但 top-6 里 3 条是页眉副本）
-#     「总结一下」              0.273  ← 只比随机噪声（0.25）高一点
-# 可见靠相似度阈值筛「总结」类问题，筛出来的往往是页眉和噪声。
-# 这类问题应该改成按全篇均匀取样，让模型看到整份文档。
+# 「总结 / 概述 / 讲了什么」问的是整篇，与任何一个片段都不相似，靠相似度阈值筛出来的
+# 往往是页眉和噪声；这类问题应改成按全篇均匀取样，让模型看到整份文档。
 _OVERVIEW_KEYWORDS = (
     "总结", "概述", "概括", "综述", "摘要", "主要内容", "大致内容", "讲了什么",
     "说了什么", "说的是什么", "讲的是什么", "讲了哪些", "都讲了", "整体内容",
@@ -144,11 +128,8 @@ class LLMUnavailableError(RuntimeError):
 def _describe_llm_error(exc: Exception) -> str:
     """把底层异常翻译成用户能直接照做的提示。
 
-    Ollama 不可用时，不同环境抛出的异常差别很大：
-      * 本机未启动      -> Connection refused / ConnectError
-      * 端口被代理拦截  -> HTTP 502 / 503（本次实测遇到的就是这种）
-      * 模型未拉取      -> 404 model not found
-    因此这里按「连接类」和「状态码类」两类特征分别兜底。
+    Ollama 不可用时不同环境抛出的异常差别很大（连接被拒、502/503、模型 404），
+    故按「连接类」和「状态码类」特征分别兜底。
     """
     text = str(exc)
     lowered = text.lower()
@@ -184,9 +165,8 @@ def _describe_llm_error(exc: Exception) -> str:
 class ThinkSplitter:
     """把推理链标签及其中的内容从流式正文里剥离出来。
 
-    小模型逐 token 输出时标签会被切碎（例如先来 ``<th`` 再来 ``ink>``），
-    因此需要在缓冲区里保留「可能是标签前缀」的尾部字符，
-    等后续 token 补齐后再判断，否则标签会漏进正文。
+    小模型逐 token 输出时标签会被切碎，因此要暂扣「可能是标签前缀」的缓冲区尾部，
+    等后续 token 补齐再判断，否则标签会漏进正文。
     """
 
     def __init__(self) -> None:
@@ -233,7 +213,6 @@ class ThinkSplitter:
         return [(ch, txt) for ch, txt in out if txt]
 
     def flush(self) -> list[tuple[str, str]]:
-        """流结束时吐出缓冲区剩余内容。"""
         if not self._buf:
             return []
         channel = "thinking" if self._in_think else "answer"
@@ -261,13 +240,10 @@ def strip_thinking(text: str) -> tuple[str, str]:
 def _build_llm() -> Any:
     from langchain_ollama import ChatOllama
 
-    # 原生 thinking 通道：开启后 Ollama 会把思维链单独放在 message.thinking，
-    # langchain-ollama 再把它放进 additional_kwargs["reasoning_content"]。
-    # 不开的话（think=false），deepseek-r1 这类模型的推理过程就被吞掉，
-    # 界面上表现为「点了发送很久没反应」，然后直接蹦出答案。
-    #
-    # 但不能对所有模型都开：不支持思考的模型（如 llama3.2）收到 think=true
-    # 可能直接报错，所以先用 /api/show 的 capabilities 确认。
+    # 原生 thinking 通道：开启后 Ollama 把思维链单独放在 message.thinking，
+    # 不开则 deepseek-r1 的推理过程被吞掉（界面表现为长时间无响应后直接蹦出答案）。
+    # 但不能对所有模型都开：不支持思考的模型（如 llama3.2）收到 think=true 可能报错，
+    # 所以先用 /api/show 的 capabilities 确认。
     reasoning: bool | None = None
     if settings.expose_thinking and ollama_client.supports_thinking(settings.llm_model):
         reasoning = True
@@ -284,8 +260,8 @@ def _build_llm() -> Any:
         temperature=settings.llm_temperature,
         num_ctx=settings.llm_num_ctx,
         num_predict=settings.llm_num_predict,
-        # 1.5B 小模型很容易陷进「同一句话连写四遍」的退化循环，
-        # 提高重复惩罚是代价最小的缓解手段（真机实测有效）。
+        # 1.5B 小模型容易陷进「同一句话连写四遍」的退化循环，提高重复惩罚是代价
+        # 最小的缓解手段。
         repeat_penalty=settings.llm_repeat_penalty,
         repeat_last_n=settings.llm_repeat_last_n,
         keep_alive="10m",
@@ -329,11 +305,8 @@ def build_context(sources: list[SourceChunk]) -> str:
     return "\n".join(blocks)
 
 
-# 引用编号的「贴身提醒」。
-#
-# 为什么要把要求再说一遍：规则写在系统提示词里、离生成位置很远，1.5B 小模型
-# 经常直接忽略（真机实测：系统提示词里已明确要求 [n]，三次回答里 0 次标注）。
-# 放在用户消息末尾（离生成最近、且属于「用户要求」）后命中率明显提高。
+# 引用编号的「贴身提醒」：规则写在系统提示词里离生成位置很远，1.5B 小模型经常直接忽略，
+# 放在用户消息末尾（离生成最近、且属于「用户要求」）命中率明显提高。
 _CITATION_REMINDER = "\n\n（回答时请给涉及文档内容的话标注来源编号，例如 [1]；不要凭空编号。）"
 
 
@@ -413,7 +386,6 @@ class RAGService:
         """流式生成，产出 ``meta`` / ``thinking`` / ``token`` / ``sources`` / ``done`` / ``error``。"""
         started = time.perf_counter()
 
-        # 1) 检索
         try:
             sources, info = self.retrieve_detailed(question, top_k, score_threshold, doc_ids)
         except Exception as exc:  # noqa: BLE001
@@ -439,7 +411,7 @@ class RAGService:
             },
         }
 
-        # 2) 无召回 → 直接返回兜底话术，不浪费一次推理
+        # 无召回就直接回兜底话术，不浪费一次推理
         if not sources:
             yield {"event": "sources", "data": {"sources": [], "cited": [], "thinking": None}}
             yield {"event": "token", "data": {"delta": NO_CONTEXT_REPLY}}
@@ -454,7 +426,6 @@ class RAGService:
             }
             return
 
-        # 3) 生成
         mode = str(info.get("mode", "qa"))
         messages = build_messages(question, sources, history, mode=mode)
         splitter = ThinkSplitter()
@@ -464,10 +435,8 @@ class RAGService:
 
         try:
             async for chunk in get_llm().astream(messages):
-                # 先收集统计信息，再做内容处理。
-                # 最后一个 chunk 的 content 通常是空的，但只有它带着
-                # eval_count / done_reason 等元数据；若放在下面的 `continue` 之后
-                # 收集，这些数据会被全部丢掉（token 数永远显示不出来）。
+                # 必须先收集统计信息再处理内容：最后一个 chunk 的 content 通常是空的，
+                # 只有它带着 eval_count / done_reason 等元数据，放到下面的 continue 之后就全丢了。
                 meta = getattr(chunk, "response_metadata", None)
                 if meta:
                     usage.update(
@@ -489,13 +458,9 @@ class RAGService:
 
                 extra = getattr(chunk, "additional_kwargs", None) or {}
 
-                # 思维链有两个来源，都要认：
-                #   * message.thinking        —— 部分 Ollama 版本/客户端直接透传
-                #   * additional_kwargs.reasoning_content
-                #     —— langchain-ollama 1.x 把**原生 thinking 通道**放在这里
-                #        （见 chat_models.py：`additional_kwargs["reasoning_content"]`）
-                #     只认前者的话，deepseek-r1 这种默认就走原生通道的模型会
-                #     全程没有任何 thinking 事件：用户点发送后界面长时间空白。
+                # 思维链有两个来源都要认：message.thinking（部分版本直接透传）与
+                # additional_kwargs.reasoning_content（langchain-ollama 1.x 把原生
+                # thinking 通道放这里）；只认前者会让 deepseek-r1 全程没有 thinking 事件。
                 direct_thinking = extra.get("thinking") or extra.get("reasoning_content")
                 if direct_thinking:
                     thinking_parts.append(str(direct_thinking))

@@ -1,13 +1,8 @@
-"""离线核心链路自测：Embeddings 本地加载 + FAISS 检索 + 文档切分。
-
-不依赖 Ollama，因此在只准备好嵌入模型时就能跑，
-可用来快速定位「检索侧」的问题。
+"""离线核心链路自测：Embeddings 本地加载 + FAISS 检索 + 文档切分（不依赖 Ollama）。
+只准备好嵌入模型就能跑，用来定位「检索侧」的问题；会如实报告 all-MiniLM-L6-v2 在
+中文语料上的命中率（见文末结论）。
 
     .venv\\Scripts\\python.exe tests\\test_offline.py
-
-注意：本测试会如实报告 all-MiniLM-L6-v2 在中文语料上的检索命中率。
-该模型以英文为主训练，中文语义匹配能力有限（见文末结论），
-这是选型时就必须知道的取舍，不建议靠调阈值掩盖。
 """
 
 from __future__ import annotations
@@ -160,9 +155,7 @@ def main() -> int:
     check("自检索余弦 ≈ 1.0", self_score > 0.98, f"score={self_score:.4f}")
 
     # ------------------------------------------------------------------
-    # 3a. 管道正确性：逐字查询必须命中原文所在文档
-    #     这一组检验的是「切分 + 向量化 + FAISS + 排序」整条管道，
-    #     与模型的语义泛化能力无关，因此必须全中。
+    # 3a. 逐字查询必须命中原文所在文档（与模型语义泛化能力无关）
     # ------------------------------------------------------------------
     print()
     print("      [管道正确性] 逐字查询（不依赖模型语义泛化能力）")
@@ -181,7 +174,7 @@ def main() -> int:
           exact_hits == len(EXACT_QUERIES), f"实际 {exact_hits}/{len(EXACT_QUERIES)}")
 
     # ------------------------------------------------------------------
-    # 3b. 语义检索质量：如实统计，不做粉饰
+    # 3b. 语义检索质量：口语化中文提问，如实统计
     # ------------------------------------------------------------------
     print()
     print("      [语义检索质量] 口语化中文提问")
@@ -231,7 +224,7 @@ def main() -> int:
         f"最低相关分={worst_top1:.4f} > 阈值={settings.score_threshold}",
     )
 
-    # 无关问题的绝对分数：用于说明「绝对阈值不可跨语言/跨模型照搬」
+    # 无关问题的绝对分数：说明绝对阈值不可跨语言/跨模型照搬
     irrelevant = store.similarity_search_with_score_by_vector(
         embeddings.embed_query("今天天气怎么样"), k=1
     )
@@ -250,9 +243,7 @@ def main() -> int:
     section("4. 文档解析与切分")
     from app.services.loader import parse_document
 
-    # 这里刻意不用 tempfile.TemporaryDirectory：它内部用 mkdtemp(0o700) 建目录，
-    # 在部分受限环境（例如带文件系统过滤的沙箱）下该目录不可写。
-    # 改用普通 mkdir 建目录，处处可用。
+    # 不用 tempfile.TemporaryDirectory：它内部 mkdtemp(0o700) 在受限环境下不可写
     work_dir = TMP_ROOT / "loader_cases"
     shutil.rmtree(work_dir, ignore_errors=True)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -263,23 +254,25 @@ def main() -> int:
         txt = tmp_path / "policy.txt"
         long_text = "公司差旅报销管理办法。\n\n" + ("第一条 市内交通费每日上限八十元。" * 40)
         txt.write_text(long_text, encoding="utf-8")
-        chunks, chars = parse_document(txt, "t1", "policy.txt")
+        outcome = parse_document(txt, "t1", "policy.txt")
+        chunks, chars = outcome.chunks, outcome.char_count
         check("TXT 解析出分块", len(chunks) >= 1, f"{len(chunks)} chunks / {chars} chars")
         check("分块不超过 chunk_size",
               all(len(c.page_content) <= settings.chunk_size for c in chunks))
         check("metadata 含 doc_id", all(c.metadata["doc_id"] == "t1" for c in chunks))
         check("chunk_index 连续",
               [c.metadata["chunk_index"] for c in chunks] == list(range(len(chunks))))
+        check("正常文档不产生解析警告", outcome.warnings == [], str(outcome.warnings))
 
         md = tmp_path / "readme.md"
         md.write_text("# 标题\n\n这是一段用于测试的 Markdown 内容，包含足够的字符以通过长度过滤。" * 5,
                       encoding="utf-8")
-        md_chunks, _ = parse_document(md, "t2", "readme.md")
+        md_chunks = parse_document(md, "t2", "readme.md").chunks
         check("Markdown 解析", len(md_chunks) >= 1, f"{len(md_chunks)} chunks")
 
         csv_file = tmp_path / "data.csv"
         csv_file.write_text("姓名,部门,工号\n张三,研发部,A001\n李四,市场部,B002\n", encoding="utf-8")
-        csv_chunks, _ = parse_document(csv_file, "t3", "data.csv")
+        csv_chunks = parse_document(csv_file, "t3", "data.csv").chunks
         check("CSV 解析为可读文本", "研发部" in csv_chunks[0].page_content)
 
         bad = tmp_path / "image.png"
@@ -294,10 +287,8 @@ def main() -> int:
 
     # ------------------------------------------------------------------
     section("5. PDF 版面还原：页眉 / 段落 / 参考文献")
-    # 真实故障（用户实机反馈「0.2 阈值下总结不出文档内容」的成因之一）：
-    # 期刊 PDF 每页都有同一段页眉，它在向量空间里是「关键词拼盘」，
-    # 对任何提问相似度都不低；参考文献列表同样如此。实测那篇 4 页论文的
-    # top-6 里 3 条是页眉副本、1 条是参考文献，正文一条都没进来。
+    # 防「页眉与参考文献副本挤掉正文」：期刊 PDF 每页都有同一段页眉，
+    # 它在向量空间里是关键词拼盘，对任何提问相似度都不低，必须先去重。
     from app.services.loader import (
         insert_paragraph_breaks,
         strip_reference_sections,
@@ -307,7 +298,7 @@ def main() -> int:
     def page(body: str) -> tuple[str, dict]:
         return (body, {})
 
-    # 页眉在奇数页和偶数页上差一个空格 —— 只折叠空白是抓不到的
+    # 页眉在奇偶页差一个空格 —— 只折叠空白是抓不到的
     pages = [
         page("2020 年第 2 期\n信息与电脑\nChina Computer & Communication人工智能与识别技术\n正文甲。"),
         page("2020 年第 2 期\n信息与电脑\nChina Computer & Communication 人工智能与识别技术\n正文乙。"),
@@ -371,7 +362,7 @@ def main() -> int:
     for question in ("多任务网络的优势是什么", "住宿费每晚多少钱", "年假有几天"):
         check(f"问答意图：{question}", detect_intent(question) == "qa")
 
-    # 很长的提问更可能是针对某个细节，不该被当成概览
+    # 很长的提问更可能是细节问题，不该判为概览
     long_question = "请总结" + "关于差旅报销与休假制度的各项具体规定以及需要留意的例外情形和审批要求" * 4
     check("超长提问不判为概览", detect_intent(long_question) == "qa",
           f"{len(long_question)} 字")
@@ -419,6 +410,30 @@ def main() -> int:
     picked = _evenly_pick([(index, None) for index in range(20)], 4)
     check("均匀取样首尾必取", [item[0] for item in picked][0] == 0
           and [item[0] for item in picked][-1] == 19, str([item[0] for item in picked]))
+
+    # ------------------------------------------------------------------
+    section("8. 扫描版 PDF 的抽取质量判定")
+    # 防「扫描件在界面上只显示索引完成」：多页且每页字符数过低 → 给出面向用户的
+    # 警告文案；页数太少则不判断（样本不足容易误伤）。
+    from app.services.loader import low_extraction_warning
+
+    blank_pages = [("", {}), ("", {}), ("", {}), ("", {})]
+    blank_warning = low_extraction_warning(blank_pages)
+    check("多页空白 PDF 判定为扫描件",
+          bool(blank_warning) and "扫描件" in blank_warning and "OCR" in blank_warning,
+          (blank_warning or "(无)")[:40])
+
+    sparse_pages = [("第 1 页", {}), ("第 2 页", {}), ("第 3 页", {})]
+    sparse_warning = low_extraction_warning(sparse_pages)
+    check("字符/页低于阈值时也报警",
+          bool(sparse_warning) and f"低于 {settings.pdf_min_chars_per_page}" in sparse_warning,
+          (sparse_warning or "(无)")[:40])
+
+    rich_pages = [("正文内容。" * 60, {}) for _ in range(4)]
+    check("正常文本量的 PDF 不误报", low_extraction_warning(rich_pages) is None)
+
+    check("页数太少时不下结论（阈值判定需要样本量）",
+          low_extraction_warning([("", {}), ("", {})]) is None)
 
     # ------------------------------------------------------------------
     print()

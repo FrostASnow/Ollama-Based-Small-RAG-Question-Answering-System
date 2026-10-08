@@ -1,42 +1,8 @@
 ﻿/* ============================================================================
- *  RAG-QA.exe —— 一体化启动 / 关闭器
- *
- *  一个不到 100KB 的单文件 exe：双击就启动（Ollama + 后端 + 浏览器），
- *  关掉窗口就把后端和 Ollama 一起收掉；托盘常驻，随时打开页面或停止服务。
- *
- *  ## 为什么是「启动器」而不是把所有东西塞进一个 exe
- *
- *  真·单文件 exe 意味着把 CPython + torch + sentence-transformers + faiss +
- *  FastAPI 全打进一个二进制（PyInstaller/onefile 大约 1.5~3GB），而且
- *  torch 的 onefile 打包在 Windows 上极易在启动时解压失败；再算上
- *  Ollama 运行时（1.4GB）和模型权重，也依然得留在外部目录。
- *  换来的只是「一个文件」的观感，代价是启动慢、易碎、无法独立升级。
- *
- *  这里选择薄启动器：**编排逻辑仍然只有一份**（scripts\start.ps1 / stop.ps1，
- *  它们有完整的测试覆盖），exe 只负责「按需拉起、盯状态、优雅收尾」。
- *  体积 40KB 左右，启动瞬时，不依赖 Python，也不需要联网。
- *
- *  ## 为什么用 .NET Framework 4.x + csc.exe 编译
- *
- *  * Windows 10 1903+ / 11 自带 .NET Framework 4.8，**零运行时安装**；
- *    而 .NET 9 的 exe 要求目标机器装对应运行时，self-contained 又要 70MB。
- *  * 本机 `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` 就能编译，
- *    不需要 .NET SDK、不需要 NuGet、不需要联网（这个项目本身要离线可用）。
- *  * 代价：编译器只支持 **C# 5** 语法，所以这里刻意不用字符串插值、
- *    空条件运算符 `?.`、表达式体成员等新语法。改动本文件时请遵守。
- *
- *  ## 几条踩过坑的工程约束
- *
- *  1. **不重定向子进程的 stdout**。受限环境里管道（named pipe）会被拒绝，
- *     直接导致启动失败。日志改由脚本自己重定向进文件，界面再读文件。
- *  2. **HTTP 探测必须关掉代理**（`req.Proxy = null`）。Windows 上一旦系统
- *     设了代理，`HttpWebRequest`/httpx 之流**连 127.0.0.1 都走代理**，
- *     结果永远是 502 —— 浏览器和 PowerShell 反而正常，极难排查。
- *  3. **停止服务一律交给 stop.ps1**，绝不用 Process.Kill 冒充停止：
- *     后端与 Ollama 是孙子进程，杀父进程会留下吃显存的孤儿；
- *     stop.ps1 里有 PID / 路径 / 端口三重定位逻辑。
- *  4. 本文件必须是 **UTF-8 带 BOM**：csc.exe 靠 BOM 判断源文件编码，
- *     没有 BOM 时会按系统 ANSI(936) 读，中文字符串会变成乱码。
+ *  RAG-QA.exe —— 一体化启动 / 关闭器：双击启动（Ollama + 后端 + 浏览器），
+ *  关掉窗口一并收掉后端与 Ollama。
+ *  用 .NET Framework 4.x 自带 csc.exe 编译（目标机零安装、可离线），代价是只支持 C# 5
+ *  语法（不用字符串插值、?. 等），且必须 UTF-8 带 BOM（否则 csc 按 ANSI(936) 读，中文乱码）。
  * ==========================================================================*/
 
 using System;
@@ -54,9 +20,7 @@ using System.Windows.Forms;
 
 namespace RagQaLauncher
 {
-    // ======================================================================
     // 命令行解析
-    // ======================================================================
     internal class Options
     {
         public string Mode = "gui";      // gui | status | start | stop | help
@@ -94,9 +58,7 @@ namespace RagQaLauncher
         }
     }
 
-    // ======================================================================
     // 控制台
-    // ======================================================================
     internal static class Con
     {
         [DllImport("kernel32.dll")]
@@ -108,16 +70,8 @@ namespace RagQaLauncher
         private const int ATTACH_PARENT_PROCESS = -1;
         private const int STD_OUTPUT_HANDLE = -11;
 
-        /// <summary>
-        /// 以 winexe 编译的程序默认没有控制台。--status/--start/--stop 被脚本调用时
-        /// 必须把输出交回去，这里同时兜住两种调用方式。
-        ///
-        /// **判断顺序很关键**：先看标准输出是不是已经被重定向（调用方写了 `> file`，
-        /// 或被管道接住），只有在**没有**重定向时才 AttachConsole。
-        /// 因为 AttachConsole 会把进程的标准句柄换成目标控制台的句柄 ——
-        /// 先附着再输出，重定向到文件的内容会凭空消失（实测踩过：
-        /// `RAG-QA.exe --status --json > out.txt` 得到 0 字节，退出码却是 0）。
-        /// </summary>
+        /// <summary>winexe 默认没有控制台，--status/--start/--stop 的输出要交回调用方。
+        /// 顺序关键：先判断 stdout 是否已被重定向，只有没重定向才 AttachConsole（否则重定向到文件的内容会凭空消失）。</summary>
         public static void PrepareOutput()
         {
             IntPtr handle = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -126,11 +80,9 @@ namespace RagQaLauncher
 
             UTF8Encoding utf8 = new UTF8Encoding(false);
 
-            // 先无条件把 Console.Out/Error 换成 UTF-8 写入器。
-            // **不要**把 Console.OutputEncoding 和 SetOut 放进同一段 try：
-            // 没有控制台时 OutputEncoding 的 setter 会抛异常，异常一旦发生，
-            // 后面的 SetOut 就被跳过，输出于是按系统 OEM 代码页(936)编码 ——
-            // 重定向到文件里的中文全变乱码，而且看不出哪里做错了。
+            // 先无条件把 Console.Out/Error 换成 UTF-8 写入器。不要把 OutputEncoding 与
+            // SetOut 放进同一个 try：没有控制台时 OutputEncoding 的 setter 会抛异常，
+            // SetOut 被跳过，输出就按 OEM 代码页(936)编码，重定向到文件的中文全乱码。
             try
             {
                 StreamWriter stdout = new StreamWriter(Console.OpenStandardOutput(), utf8);
@@ -150,9 +102,7 @@ namespace RagQaLauncher
         }
     }
 
-    // ======================================================================
     // 路径解析
-    // ======================================================================
     internal class AppLayout
     {
         public string Root;
@@ -166,10 +116,7 @@ namespace RagQaLauncher
         public string LauncherLog;
         public string StateFile;
 
-        /// <summary>
-        /// exe 放在项目根目录，但用户也可能把它丢进子目录或从任何位置调用，
-        /// 所以向上找「有 scripts\start.ps1 的那一层」作为项目根。
-        /// </summary>
+        /// <summary>exe 可能在根目录、子目录或任意位置调用：向上找「有 scripts\start.ps1 的那一层」作为项目根。</summary>
         public static AppLayout Discover()
         {
             AppLayout l = new AppLayout();
@@ -212,9 +159,7 @@ namespace RagQaLauncher
         }
     }
 
-    // ======================================================================
     // 健康探测
-    // ======================================================================
     internal class Health
     {
         public bool Ok;
@@ -234,7 +179,7 @@ namespace RagQaLauncher
 
     internal static class Probe
     {
-        /// <summary>本机 HTTP 探测：显式禁用代理（见文件头第 2 条）。</summary>
+        /// <summary>本机 HTTP 探测：必须显式禁用代理，否则 127.0.0.1 也会走系统代理拿到 502。</summary>
         public static string HttpGet(string url, int timeoutMs)
         {
             try
@@ -277,11 +222,8 @@ namespace RagQaLauncher
 
         public static Health Check(int port, int timeoutMs)
         {
-            // 先探 TCP，只有端口真的有人听才发 HTTP。
-            //
-            // 为什么必须这样：本机连一个**关闭**的端口未必会立刻被拒绝 ——
-            // 实测这台机器上对 127.0.0.1 的关闭端口发起连接要等满 2 秒
-            // （SYN 被静默丢弃而不是回 RST）。20 个端口就是 40 秒。
+            // 先探 TCP，只有端口真的有人听才发 HTTP：本机连「关闭」的端口未必立刻被拒绝，
+            // 可能要等满连接超时（SYN 被静默丢弃、不回 RST），20 个端口就会拖很久。
             if (!TcpOpen(port, 150)) return null;
             return CheckHttp(port, timeoutMs);
         }
@@ -341,13 +283,8 @@ namespace RagQaLauncher
             return false;
         }
 
-        /// <summary>
-        /// 快速探测：只看「状态文件记过的端口」和「首选端口」。
-        ///
-        /// 定时刷新必须走这条路径。扫 20 个端口看着无害，但在「关闭端口不会立刻
-        /// 拒绝连接」的机器上，一次刷新要几十秒 —— 放在 UI 线程上就是窗口
-        /// 一直「未响应」（实测 82% 的采样点被阻塞，用户看到的就是疯狂卡死）。
-        /// </summary>
+        /// <summary>快速探测：只看「状态文件记过的端口」和「首选端口」，定时刷新必须走这条路径。
+        /// 扫 20 个端口在「关闭端口不立刻拒绝连接」的机器上会把窗口拖成一直「未响应」。</summary>
         public static Health FindRunningQuick(AppLayout layout, int preferredPort, int lastKnownPort)
         {
             List<int> ports = new List<int>();
@@ -398,39 +335,19 @@ namespace RagQaLauncher
         }
     }
 
-    // ======================================================================
     // 启动 / 停止（一律委托给 scripts 下的脚本）
-    // ======================================================================
     internal static class Service
     {
-        /// <summary>
-        /// 拼 PowerShell 字符串字面量。
-        ///
-        /// **必须用单引号**：这些片段最终会被塞进 `-Command "…"` 里，
-        /// 内部再用双引号会和外层引号提前配对，命令被截断成半句 ——
-        /// 表现是子进程安静地什么都没干（连重定向的日志文件都不会生成）。
-        /// 路径里的单引号按 PowerShell 规则写成两个。
-        /// </summary>
+        /// <summary>拼 PowerShell 字符串字面量。必须用单引号：这些片段会塞进 `-Command "…"`，
+        /// 内部用双引号会和外层引号提前配对，命令被截断，子进程安静地什么都没干。</summary>
         public static string PsQuote(string value)
         {
             return "'" + value.Replace("'", "''") + "'";
         }
 
-        /// <summary>
-        /// 把一段 PowerShell 代码包进转录（transcript），输出落进日志文件。
-        ///
-        /// **为什么不用 `*> 文件`**：start.ps1 是在 `$ErrorActionPreference='Stop'`
-        /// 下前台运行 uvicorn 的，而 PS 5.1 会把「被重定向的原生命令 stderr 输出」
-        /// 当成 NativeCommandError 终止性错误 —— uvicorn 刚写第一行日志，
-        /// 整个脚本就被弹飞，端口根本没监听。实测现象极具误导性：
-        /// 日志停在「按 Ctrl+C 停止服务」、进程消失、而退出码是 0。
-        /// Start-Transcript 走宿主输出通道，不碰原生命令的流，因此安全。
-        ///
-        /// **不要给 powershell.exe 传 `-WindowStyle Hidden`**：那样 PowerShell 自己
-        /// 就没有控制台了，start.ps1 会卡在启动阶段（连转录文件都不会创建），
-        /// 而进程还活着 —— 极难判断。隐藏窗口交给 ProcessStartInfo.WindowStyle
-        /// （等价于 `Start-Process -WindowStyle Hidden`），进程照样有隐藏控制台。
-        /// </summary>
+        /// <summary>把一段 PowerShell 代码包进转录，输出落进日志文件 —— 不用 `*&gt; 文件`：
+        /// start.ps1 在 'Stop' 下前台跑 uvicorn，PS 5.1 会把被重定向的原生命令 stderr 当成终止错误。
+        /// 也不要给 powershell.exe 传 -WindowStyle Hidden（那样它自己没有控制台，脚本会卡在启动阶段）。</summary>
         private static string WithTranscript(string payload, string logPath)
         {
             return "Start-Transcript -Path " + PsQuote(logPath) + " -Force | Out-Null; " +
@@ -438,13 +355,8 @@ namespace RagQaLauncher
                    "; Stop-Transcript | Out-Null";
         }
 
-        /// <summary>
-        /// 拉起后端。start.ps1 会自己处理「Ollama 没起来就先起来」「端口被占」
-        /// 「等健康检查通过再开浏览器」这些事，前台阻塞运行 = 服务生命周期。
-        ///
-        /// 输出交给 PowerShell 自己收集，**不要**用 Process 的管道：
-        /// 受限环境下 named pipe 会被拒绝，管道一旦失败服务就起不来。
-        /// </summary>
+        /// <summary>拉起后端（start.ps1 负责 Ollama、端口占用、就绪后再开浏览器）。输出交给
+        /// PowerShell 自己收集，不要用 Process 管道：受限环境下命名管道被拒会让服务起不来。</summary>
         public static Process Start(AppLayout layout, int port, bool noBrowser, bool keepOllama)
         {
             string payload = "& " + PsQuote(layout.StartScript) + " -Port " + port;
@@ -497,10 +409,8 @@ namespace RagQaLauncher
                 Thread.Sleep(250);
             }
 
-            // stop.ps1 没能收干净？兜底强杀。
-            // 受限账户下脚本可能查不到进程（Get-CimInstance / Get-NetTCPConnection
-            // 会「拒绝访问」），那种情况下用户点「停止」将毫无反应，
-            // 所以这里再用 netstat 找一次监听者，按进程树结束。
+            // stop.ps1 没能收干净？兜底强杀：受限账户下脚本可能查不到进程
+            // （Get-CimInstance / Get-NetTCPConnection 会「拒绝访问」），这里用 netstat 再找一次。
             int pid = FindListenerPid(port);
             if (pid > 0)
             {
@@ -516,10 +426,8 @@ namespace RagQaLauncher
             return !Probe.TcpOpen(port, 300);
         }
 
-        /// <summary>
-        /// 按端口找监听进程。用 netstat -ano 解析而不是 Get-NetTCPConnection：
-        /// 后者在受限账户下会直接抛「拒绝访问」，整条兜底路径形同虚设。
-        /// </summary>
+        /// <summary>按端口找监听进程。用 netstat -ano 解析而不是 Get-NetTCPConnection：
+        /// 后者在受限账户下会直接抛「拒绝访问」，整条兜底路径形同虚设。</summary>
         public static int FindListenerPid(int port)
         {
             try
@@ -587,9 +495,7 @@ namespace RagQaLauncher
         }
     }
 
-    // ======================================================================
     // 启动器自己的日志（与后端日志分开，出问题时好对照）
-    // ======================================================================
     internal static class Log
     {
         private static readonly object Gate = new object();
@@ -643,9 +549,7 @@ namespace RagQaLauncher
         }
     }
 
-    // ======================================================================
     // 主程序
-    // ======================================================================
     internal static class Program
     {
         [STAThread]
@@ -775,8 +679,7 @@ namespace RagQaLauncher
                 sb.Append("\"chunks\":").Append(running != null ? running.Chunks : 0).Append(",");
                 sb.Append("\"ollama\":").Append(ollama ? "true" : "false");
                 sb.Append("}");
-                // 同时落一份到 data\logs：PowerShell 不等待 GUI 程序，
-                // 调用方（脚本、测试、排错）可以稳定地从文件读取结果。
+                // 同时落一份到 data\logs：PowerShell 不等待 GUI 程序，调用方可从文件稳定读取。
                 try
                 {
                     Directory.CreateDirectory(layout.LogsDir);
@@ -840,9 +743,7 @@ namespace RagQaLauncher
         }
     }
 
-    // ======================================================================
     // 图形面板
-    // ======================================================================
     internal class MainForm : Form
     {
         private readonly Options _options;
@@ -870,8 +771,8 @@ namespace RagQaLauncher
         private volatile bool _refreshPending;
         private long _lastFullScanTicks;
         private string _logTail = "";
-        // 0=空闲 1=启动中 2=停止中。用独立状态而不是 _busy：
-        // 否则停止过程中会被刷新线程覆盖成「正在启动…」，状态显示来回跳。
+        // 0=空闲 1=启动中 2=停止中。用独立状态而不是 _busy：否则停止过程会被刷新线程
+        // 覆盖成「正在启动…」，状态显示来回跳。
         private volatile int _phase;
 
         public MainForm(Options options, EventWaitHandle showSignal)
@@ -885,9 +786,8 @@ namespace RagQaLauncher
             watcher.IsBackground = true;
             watcher.Start();
 
-            // 状态刷新放在后台线程：探测要发 HTTP/建连接，**绝不能**在 UI 线程上做。
-            // 之前就是在这里栽的 —— 关闭端口不立刻拒绝连接的机器上，
-            // 一个刷新周期要几十秒，窗口表现为持续「未响应」。
+            // 状态刷新放后台线程：探测要发 HTTP/建连接，绝不能在 UI 线程上做，否则在
+            // 「关闭端口不立刻拒绝连接」的机器上一个刷新周期几十秒 → 持续「未响应」。
             Thread refresher = new Thread(RefreshLoop);
             refresher.IsBackground = true;
             refresher.Start();
@@ -899,9 +799,7 @@ namespace RagQaLauncher
             };
         }
 
-        // ------------------------------------------------------------------
         // 后台刷新
-        // ------------------------------------------------------------------
         private void RequestRefresh()
         {
             _refreshPending = true;
@@ -1101,8 +999,7 @@ namespace RagQaLauncher
             _tray.DoubleClick += delegate { RestoreWindow(); };
 
             _timer = new System.Windows.Forms.Timer();
-            // 计时器只负责「请求一次刷新」，真正的探测在后台线程做。
-            // 以前这里直接调 RefreshState()（内部发 HTTP），窗口必然卡死。
+            // 计时器只负责「请求一次刷新」，真正的探测在后台线程做（直接在这里发 HTTP 会卡死窗口）。
             _timer.Interval = 1500;
             _timer.Tick += delegate { RequestRefresh(); };
             _timer.Start();
@@ -1148,9 +1045,7 @@ namespace RagQaLauncher
             Activate();
         }
 
-        // ------------------------------------------------------------------
         // 启动 / 停止（都不阻塞 UI 线程）
-        // ------------------------------------------------------------------
         private void StartService()
         {
             if (!_layout.ReadyToStart())
@@ -1294,8 +1189,7 @@ namespace RagQaLauncher
                     e.Cancel = true;
                     return;
                 }
-                // 取消这次关闭，改成「后台停止 → 完成后自己关」。
-                // 直接在这里同步停止会让窗口卡住几十秒（也就是「未响应」）。
+                // 取消这次关闭，改成「后台停止 → 完成后自己关」；同步停止会让窗口卡住几十秒。
                 e.Cancel = true;
                 StopServiceAsync(false, true);
                 return;

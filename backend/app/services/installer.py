@@ -1,25 +1,8 @@
-"""一键安装：让用户直接在网页上跑完环境准备，不必复制命令到终端。
+"""一键安装：让用户直接在网页上跑完环境准备。
 
-设计要点
---------
-1. **输出重定向到文件，而不是管道捕获**
-   子进程的 stdout/stderr 直接写进 ``data/logs/install.log``。
-   管道在这里有两个问题：部分受限环境禁止匿名管道；而且后端一旦重启，
-   管道里的内容就丢了，而日志文件还在、还能续着看。
-
-2. **后台线程 + 增量读文件**
-   一个线程只负责等待进程结束并记录退出码；日志通过「记住上次读到的偏移量」
-   增量读取。因此流式接口天然支持「中途接入」——用户刷新页面后
-   仍能看到完整历史，而不是只能看后续输出。
-
-3. **单例 + 互斥**
-   同一时间只允许一个安装任务。重复点击返回 409，避免两个 prepare.ps1
-   并发去下载同一个 1.4GB 文件。
-
-4. **可取消**
-   ``prepare.ps1`` 会再拉起 python/ollama 等子进程，所以取消时要按进程树杀
-   （``taskkill /T``），只杀 PowerShell 本身会留下孤儿进程。
-"""
+子进程输出重定向到文件而非管道捕获（受限环境禁止匿名管道，后端重启也会丢管道内容）；
+日志靠字节偏移量增量读取，故刷新页面后仍能回放完整历史；单例互斥防并发下载；
+取消时按进程树杀（prepare.ps1 下面还有 python/ollama 子进程）。"""
 
 from __future__ import annotations
 
@@ -60,7 +43,7 @@ class Installer:
         self._mode: dict[str, Any] = {}
         self._log_handle: Any = None
         self._lines_read = 0
-        # 进度行节流状态：进度条一秒能刷新几十次，全推给前端既没用又卡
+        # 进度行节流状态：进度条一秒刷新几十次，全推给前端既没用又卡
         self._last_progress_text: str | None = None
         self._last_progress_at = 0.0
 
@@ -107,7 +90,7 @@ class Installer:
                 args.append("-SkipOllama")
 
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
-            # 每次都从头写，避免上次的失败信息混进这次的输出里
+            # 每次都从头写，避免上次的失败信息混进这次输出
             try:
                 INSTALL_LOG.write_text("", encoding="utf-8")
             except OSError as exc:
@@ -117,11 +100,9 @@ class Installer:
             self._last_progress_text = None
             self._last_progress_at = 0.0
 
-            # 先写好服务端自己的头部，再打开子进程的输出句柄，顺序不能反。
-            # 两个写者各自维护文件位置：如果先用 "wb" 打开句柄（位置在 0）
-            # 再去 _append 写头部，子进程第一笔输出就会从偏移 0 开始，
-            # 把头部整段覆盖 —— 日志里会出现 "g-qa" 这种被啃掉前半截的碎片。
-            # 句柄改用 "ab" 追加模式，并在写完之后再打开，两个写者才不会打架。
+            # 顺序不能反：先写服务端头部，再用 "ab" 追加模式打开子进程输出句柄。
+            # 若先以 "wb" 打开（文件位置在 0）再追加头部，子进程第一笔输出会从偏移 0
+            # 覆盖上去，日志里出现被啃掉前半截的行。
             self._append("[rag-qa] 开始准备环境 ...")
             self._append(f"[rag-qa] 命令：{' '.join(args)}")
             self._append(f"[rag-qa] 完整日志：{INSTALL_LOG}")
@@ -176,8 +157,24 @@ class Installer:
 
         self._append(f"[rag-qa] 进程结束，退出码 {returncode}")
         self._append(f"[rag-qa] 任务状态：{final_status}")
+
+        # prepare.ps1 刚拉完 LLM 模型（或刚装好便携版 Ollama），两个探测结果的
+        # TTL 缓存不主动失效的话，用户看到 [OK] 后界面仍会报「没有这个模型」。
+        if final_status == "succeeded":
+            self._invalidate_probe_caches()
+
         self._cleanup_handle()
         logger.info("安装任务结束：status=%s returncode=%s", final_status, returncode)
+
+    @staticmethod
+    def _invalidate_probe_caches() -> None:
+        """让 Ollama 探测缓存立刻失效（安装刚结束，模型列表多半已经变了）。"""
+        try:
+            from app.services.ollama_client import invalidate_all
+
+            invalidate_all()
+        except Exception as exc:  # noqa: BLE001 - 缓存刷新失败不该影响安装收尾
+            logger.debug("刷新 Ollama 探测缓存失败（忽略）：%s", exc)
 
     def _cleanup_handle(self) -> None:
         try:
@@ -233,14 +230,9 @@ class Installer:
     def _parse_segments(data: bytes) -> list[dict[str, Any]]:
         """把原始字节解析成日志行，并区分「普通行」和「进度行」。
 
-        终止符决定了这一行的性质：
-
-        * ``\\n`` 结尾 —— 普通行，应当追加到日志里
-        * ``\\r`` 结尾 —— 进度刷新（curl 进度表、tqdm 进度条都这么做），
-          语义是「回到行首重写」，所以前端应当**覆盖上一行**而不是追加
-
-        不区分的话，一次 1.4GB 的下载就能刷出成百上千行 ``0  0  0  0  0``，
-        真正的错误信息反而被冲出视野 —— 用户看到的就是满屏噪音。
+        终止符决定行性质：``\\n`` 是普通行（追加），``\\r`` 是进度刷新（curl、tqdm
+        都这么做，语义是回到行首重写），前端应**覆盖上一行**而非追加；不区分的话
+        一次大文件下载就会刷出成百上千行 ``0 0 0 0 0``，把真正的错误冲出视野。
         """
         text = data.decode("utf-8", errors="replace")
         segments: list[dict[str, Any]] = []
@@ -275,9 +267,7 @@ class Installer:
         return collapsed
 
     def _throttle_progress(self, segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """限制进度行的推送频率。
-
-        规则：内容没变就丢弃；变化太频繁也丢弃（约每 300ms 一条），
+        """限制进度行的推送频率：内容没变或变化太频繁（约 300ms 一条）就丢弃，
         但**每一轮的最后一条进度一定发出**，否则界面会停在过时的进度上。
         """
         now = time.monotonic()
@@ -306,11 +296,9 @@ class Installer:
     def read_new_lines(self) -> list[dict[str, Any]]:
         """增量读取日志新增内容。
 
-        必须以**字节**为单位推进偏移量，不能按解码后的字符串长度回退：
-        子进程随时可能写出半行，末尾的多字节字符被截断后解码会得到替换字符
-        （U+FFFD），而它重新编码成 UTF-8 是 3 字节 —— 与原始残缺序列的字节数
-        并不相同，偏移量会一点一点漂移，于是日志里出现 ``g-qa`` 这种被啃掉
-        前半截的行，甚至整段重复。
+        偏移量必须以**字节**为单位推进：子进程随时可能写出半行，末尾多字节字符被
+        截断后解码得到 U+FFFD，重新编码是 3 字节、与原始残缺序列不等长，偏移量会
+        逐渐漂移，日志里就会出现被啃掉前半截的行甚至整段重复。
         """
         if not INSTALL_LOG.is_file():
             return []
@@ -335,13 +323,10 @@ class Installer:
         return self._throttle_progress(self._parse_segments(complete))
 
     def replay(self, max_lines: int = MAX_REPLAY_LINES) -> tuple[list[dict[str, Any]], int]:
-        """读取已有日志供回放。
+        """读取已有日志供回放，返回 ``(最近若干行, 应当设置的读取偏移量)``。
 
-        返回 ``(最近若干行, 应当设置的读取偏移量)``。
-
-        行和偏移量必须在**同一次读取**里确定：先 tail 再 sync 的话，
-        两次调用之间新写入的内容会被永久跳过。偏移量也只推进到最后一个
-        完整换行处，避免把半行当成已消费。
+        行和偏移量必须在**同一次读取**里确定：先 tail 再 sync 的话，两次调用之间
+        新写入的内容会被永久跳过；偏移量也只推进到最后一个完整换行处。
         """
         if not INSTALL_LOG.is_file():
             return [], 0
@@ -382,8 +367,7 @@ async def stream_install() -> Any:
 
     snapshot = installer.snapshot()
 
-    # 1) 回放已有日志，让中途刷新页面的用户也能看到完整过程。
-    #    replay() 同时给出偏移量，避免「先读后同步」之间新写入的内容被跳过。
+    # 回放已有日志，让中途刷新页面的用户也能看到完整过程
     if snapshot["status"] != "idle":
         replay_segments, offset = installer.replay()
         installer.set_offset(offset)
@@ -395,7 +379,6 @@ async def stream_install() -> Any:
         yield format_sse("end", snapshot)
         return
 
-    # 2) 跟进增量输出
     idle_rounds = 0
     while True:
         segments = installer.read_new_lines()
@@ -430,4 +413,4 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
-__all__ = ["installer", "stream_install", "estimate_seconds", "INSTALL_LOG"]
+__all__ = ["installer", "stream_install", "INSTALL_LOG"]

@@ -1,17 +1,9 @@
-"""HTTP 层验收测试（针对真实运行的 uvicorn 服务）。
+"""HTTP 层验收测试（针对真实运行的 uvicorn 服务）。覆盖前端静态托管、文档上传/
+列表/删除、检索接口与 SSE 流式问答的事件协议；Ollama 未启动时断言问答接口返回
+结构化 error 事件，而不是静默挂断或 500。**本套件会 DELETE /api/documents
+（清空知识库）**，只能对着使用临时数据目录的实例运行（见 .\\tests\\run_all.ps1）。
 
-覆盖前端静态托管、文档上传/列表/删除、检索接口，以及 SSE 流式问答的事件协议。
-即使 Ollama 未启动也能跑：问答接口会走到 error 分支，本测试会断言
-「服务端返回结构化的 error 事件，而不是静默挂断或 500」。
-
-用法：
-    .\\tests\\run_all.ps1
     .venv\\Scripts\\python.exe tests\\test_http.py --base http://127.0.0.1:8099
-
-**注意：本套件会 DELETE /api/documents（清空知识库）**，因此只允许对着
-使用临时数据目录的实例运行。`run_all.ps1` 会自动起一个这样的实例；
-如果直接对着 `scripts\\start.cmd` 启动的服务跑，测试会在第一步就拒绝执行
-（依据 /api/health 上报的 data_dir），避免误删用户上传的文档。
 """
 
 from __future__ import annotations
@@ -93,14 +85,12 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    # 等待服务真正就绪。
-    # 在带网络代理的环境里，服务刚启动、端口尚未监听时，首个请求可能收到
-    # 代理返回的 502 而不是连接错误，直接判定失败会造成误报。
+    # 等待服务真正就绪：带代理的环境里，端口尚未监听时首个请求可能收到代理
+    # 返回的 502 而不是连接错误。
     #
-    # trust_env=False 是关键：Windows 上一旦系统设置了代理（注册表里的
-    # ProxyEnable/ProxyServer），httpx 会**连 127.0.0.1 也走代理**，于是本地
-    # 服务永远拿到 502 —— 表现为「服务未就绪」，但用浏览器/Invoke-RestMethod
-    # 又是好的（它们会读代理绕过列表，httpx 不读）。本套件只测本机服务。
+    # trust_env=False 是关键：Windows 上一旦设置了系统代理，httpx 会连
+    # 127.0.0.1 也走代理，本地服务永远拿到 502（浏览器与 Invoke-RestMethod
+    # 会读代理绕过列表，httpx 不读）。本套件只测本机服务。
     ready = False
     with httpx.Client(base_url=base, timeout=5.0, trust_env=False) as probe:
         for _ in range(80):
@@ -134,10 +124,8 @@ def main() -> int:
         health = r.json()
 
         # ------------------------------------------------------------------
-        # 安全检查：本套件会 DELETE /api/documents（清空知识库）。
-        # 如果目标服务用的是真实 data/ 目录，那它删掉的是用户上传的文档 ——
-        # 数据丢失，不是「测试副作用」。发现这种情况立即停手。
-        # 正确用法：用 tests\run_all.ps1 跑，它会启动一个使用临时数据目录的实例。
+        # 安全检查：本套件会 DELETE /api/documents（清空知识库），对着真实
+        # data/ 目录跑删掉的就是用户上传的文档 —— 数据丢失，立即停手。
         # ------------------------------------------------------------------
         target_data_dir = (health.get("detail") or {}).get("data_dir", "")
         real_data_dir = PROJECT_ROOT / "data"
@@ -193,6 +181,37 @@ def main() -> int:
                                             "summary_max_chunks", "strip_boilerplate")),
               str({key: config.get(key) for key in ("score_window", "score_floor",
                                                      "dedupe_ratio", "summary_max_chunks")}))
+
+        # GET 与 PUT 必须字段对称：GET 返回的每一项都要能原样写回去。
+        # 以前两边各写一份字段清单，结果 GET 有 llm_num_ctx / dedupe_ratio
+        # 而 PUT 根本收不到。
+        r = client.put("/api/config", json=config)
+        check("GET 返回的每一项都能 PUT 回去", r.status_code == 200, f"HTTP {r.status_code}")
+        echoed = r.json()
+        check("PUT 的响应字段与 GET 完全一致", set(echoed) == set(config),
+              str(sorted(set(echoed) ^ set(config))) or f"{len(echoed)} 个字段")
+        check("回显与提交值一致", all(echoed[key] == config[key] for key in config),
+              str([key for key in config if echoed.get(key) != config[key]]) or "全部一致")
+
+        r = client.put("/api/config", json={"chunk_size": 500, "chunk_overlap": 600})
+        check("自相矛盾的切分参数被拒绝（400）", r.status_code == 400, f"HTTP {r.status_code}")
+
+        r = client.put("/api/config", json={"allowed_extensions": ["txt", "MD"]})
+        check("扩展名会被归一化成小写带点的形式（保序）",
+              r.status_code == 200 and r.json()["allowed_extensions"] == [".txt", ".md"],
+              str(r.json().get("allowed_extensions")))
+        client.put("/api/config", json={"allowed_extensions": config["allowed_extensions"]})
+
+        index_report = (health.get("detail") or {}).get("index") or {}
+        check("健康检查上报索引一致性报告",
+              index_report.get("state") in ("empty", "ok", "stale", "incompatible"),
+              str(index_report.get("state")))
+        check("索引报告含四个维度的对比数据",
+              all(key in (index_report.get("dimension") or {})
+                  for key in ("index", "model", "recorded", "declared")),
+              str(index_report.get("dimension")))
+        check("顶层索引字段与报告一致",
+              (health.get("detail") or {}).get("index_compatible") == index_report.get("compatible"))
 
         r = client.get("/api/models")
         check("GET /api/models 返回 200", r.status_code == 200)
@@ -250,9 +269,43 @@ def main() -> int:
         check("GET /api/documents 返回 200", r.status_code == 200)
         check("列表含 1 个文档", listing["total"] == 1, str(listing["total"]))
         check("分块统计一致", listing["total_chunks"] == doc["chunk_count"])
+        check("文档记录带 warnings 字段（前端据此显示解析警告）",
+              isinstance(doc.get("warnings"), list)
+              and isinstance(listing["documents"][0].get("warnings"), list),
+              str(doc.get("warnings")))
 
         r = client.get(f"/api/documents/{uploaded_doc_id}/chunks")
         check("分块预览接口可用", r.status_code == 200 and r.json()["returned"] > 0)
+
+        # ------------------------------------------------------------------
+        section("3b. 改切分参数 → 僵尸知识库必须被报出来")
+        # 改了 chunk_size 后旧索引照常能检索，只是分块还是老参数切的 ——
+        # 以前这件事完全静默，用户无从发现。
+        original_chunk = config["chunk_size"]
+        r = client.put("/api/config", json={"chunk_size": original_chunk + 100})
+        check("PUT chunk_size 生效",
+              r.status_code == 200 and r.json()["chunk_size"] == original_chunk + 100,
+              f"HTTP {r.status_code}")
+        stale_health = client.get("/api/health").json()
+        check("索引与配置漂移后健康检查转为 degraded",
+              stale_health["status"] == "degraded", str(stale_health["status"]))
+        check("提示里给出「重建索引」这条出路",
+              any("重建索引" in item
+                  for item in (stale_health.get("detail") or {}).get("problems", [])),
+              str((stale_health.get("detail") or {}).get("problems"))[:90])
+        check("索引仍标记为「兼容但过期」（不阻断检索）",
+              (stale_health.get("detail") or {}).get("index_compatible") is True
+              and (stale_health.get("detail") or {}).get("index_stale") is True)
+
+        search_after = client.post("/api/search", json={"query": "住宿费", "score_threshold": 0.0})
+        check("过期索引下检索依然可用", search_after.status_code == 200,
+              f"HTTP {search_after.status_code}")
+
+        client.put("/api/config", json={"chunk_size": original_chunk})
+        restored_health = client.get("/api/health").json()
+        check("改回原参数后索引重新一致",
+              (restored_health.get("detail") or {}).get("index_stale") is False,
+              str((restored_health.get("detail") or {}).get("index", {}).get("state")))
 
         # 不支持的类型应被拒绝且不中断整批
         with SAMPLE.open("rb") as handle:
@@ -307,6 +360,10 @@ def main() -> int:
               report.get("rebuilt", 0) >= 1 and isinstance(report.get("chunks_after"), int),
               f"rebuilt={report.get('rebuilt')} {report.get('chunks_before')}->"
               f"{report.get('chunks_after')}")
+        check("重建报告带索引状态与备份路径",
+              report.get("index_state_before") in ("ok", "stale", "incompatible")
+              and bool(report.get("backup_dir")),
+              f"state={report.get('index_state_before')} backup={report.get('backup_dir')}")
         check("重建后分块数不为 0", report.get("chunks_after", 0) > 0,
               str(report.get("chunks_after")))
         check("重建明细逐文档返回",
@@ -419,7 +476,7 @@ def main() -> int:
 
         # 与 /api/health 的判定必须一致，否则前端会误导用户。
         # 注意 Ollama 是否「装全」也要算进去：只有 ollama.exe 时服务照样可达、
-        # 模型照样列得出来，但一发提问就失败 —— 那种情况下 setup 必须判为未就绪。
+        # 模型照样列得出来，但一发提问就失败。
         install = health.get("detail", {}).get("ollama_install") or {}
         expect_ready = bool(
             health.get("ollama_reachable")
@@ -472,8 +529,8 @@ def main() -> int:
               placeholder_hits[0][:70] if placeholder_hits else "")
 
         project_root = setup["environment"]["project_root"]
-        # 引用项目内脚本/可执行文件的命令必须是绝对路径，
-        # 否则用户复制到别的目录执行就会找不到文件
+        # 引用项目内脚本/可执行文件的命令必须是绝对路径，否则用户复制到
+        # 别的目录执行就会找不到文件
         relative_hits = [
             c for c in all_commands
             if ("scripts\\" in c or "tools\\" in c or ".venv" in c)

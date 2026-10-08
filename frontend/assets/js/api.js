@@ -1,9 +1,6 @@
 /**
- * 后端 API 客户端。
- *
- * 全部基于浏览器原生 fetch，不依赖 axios 等库，保证离线可用。
- * 关键点：问答接口用的是 **POST + SSE**，而原生 EventSource 只支持 GET，
- * 因此这里用 fetch 的 ReadableStream 手动解析 SSE 帧。
+ * 后端 API 客户端（原生 fetch，无第三方库）。
+ * 问答用 POST + SSE，而 EventSource 只支持 GET，所以这里手工解析 SSE 帧。
  */
 
 const BASE = '';
@@ -45,10 +42,7 @@ export function getHealth() {
   return request('/api/health');
 }
 
-/**
- * 首次配置体检。
- * @param {boolean} fresh 是否绕过后端探测缓存（用户装完东西点「重新检测」时用）
- */
+/** 首次配置体检；fresh 用于用户装完东西点「重新检测」时绕过后端探测缓存。 */
 export function getSetup(fresh = false) {
   return request(`/api/setup${fresh ? '?fresh=true' : ''}`);
 }
@@ -79,11 +73,7 @@ export function resetInstall() {
 
 /**
  * 订阅安装过程的实时输出。
- *
- * 服务端会在开头回放已有日志，所以中途刷新页面也能看到完整历史。
- *
- * @param {object} handlers { onLog(line), onStatus(snapshot), onEnd(snapshot) }
- * @param {AbortSignal} signal
+ * 服务端开头会回放已有日志，所以中途刷新页面也能看到完整历史。
  */
 export async function streamInstall(handlers = {}, signal) {
   const response = await fetch(`${BASE}/api/setup/install/stream`, {
@@ -101,7 +91,7 @@ export async function streamInstall(handlers = {}, signal) {
   const parser = createSseParser((event, data) => {
     switch (event) {
       case 'log':
-        // progress=true 表示这是 \r 刷新的进度行，前端应当覆盖上一行
+        // progress=true 是 \r 刷新的进度行，前端应覆盖上一行
         handlers.onLog?.(data.line ?? '', data.progress === true);
         break;
       case 'status': handlers.onStatus?.(data); break;
@@ -161,20 +151,13 @@ export function clearAllDocuments() {
   return request('/api/documents', { method: 'DELETE' });
 }
 
-/**
- * 用原始文件按当前解析/切分配置重建整个索引。
- * 解析逻辑（页眉过滤、分块大小）更新后，旧索引不会自动跟着变，需要重建。
- */
+/** 用原始文件按当前解析/切分配置重建索引：解析逻辑更新后旧索引不会自动跟着变。 */
 export function reindexDocuments() {
   return request('/api/documents/reindex', { method: 'POST' });
 }
 
 /**
- * 上传文件。用 XMLHttpRequest 是为了拿到上传进度
- * （fetch 目前无法可靠上报请求体进度）。
- * @param {File[]} files
- * @param {(percent:number)=>void} onProgress
- * @param {AbortSignal} [signal]
+ * 上传文件。用 XMLHttpRequest 是为了拿到上传进度（fetch 无法可靠上报请求体进度）。
  */
 export function uploadDocuments(files, onProgress, signal) {
   return new Promise((resolve, reject) => {
@@ -230,11 +213,7 @@ export function search(query, options = {}) {
 /* ------------------------------------------------------------------ */
 
 /**
- * 解析 SSE 帧。
- * 一帧形如：
- *   event: token
- *   data: {"delta":"你"}
- *   <空行>
+ * 解析 SSE 帧：一帧形如 `event: token` + `data: {...}` + 空行。
  * 以 ":" 开头的行是心跳注释，直接忽略。
  */
 function createSseParser(onEvent) {
@@ -274,11 +253,7 @@ function createSseParser(onEvent) {
 }
 
 /**
- * 发起流式问答。
- *
- * @param {object} payload  { question, history, top_k, score_threshold, doc_ids }
- * @param {object} handlers { onMeta, onThinking, onToken, onSources, onDone, onError }
- * @param {AbortSignal} signal
+ * 发起流式问答；payload 为 { question, history, top_k, score_threshold, doc_ids }。
  */
 export async function streamChat(payload, handlers = {}, signal) {
   const response = await fetch(`${BASE}/api/chat`, {

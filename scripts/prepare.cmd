@@ -1,11 +1,7 @@
 @echo off
 rem ===========================================================================
 rem  Offline RAG Document QA -- one-time online preparation
-rem
-rem  Double-click to install dependencies + download embedding model +
-rem  download portable Ollama + pull the LLM. Needs internet, run once.
-rem  After it finishes the app works fully offline.
-rem
+rem  Double-click to run: needs internet, run once. After that the app is offline.
 rem  IMPORTANT: keep this file ASCII-only (see start.cmd for the reason).
 rem ===========================================================================
 setlocal

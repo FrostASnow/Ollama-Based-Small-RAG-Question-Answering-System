@@ -1,8 +1,5 @@
-"""文档解析与切分。
-
-支持格式：.txt .md .markdown .log .json .csv .pdf .docx
-每种格式都产出带统一 metadata 的 LangChain ``Document``：
-    doc_id / filename / stored_name / page / chunk_index / ext
+"""文档解析与切分：.txt .md .markdown .log .json .csv .pdf .docx。
+各格式产出带统一 metadata 的 LangChain ``Document``。
 """
 
 from __future__ import annotations
@@ -13,6 +10,7 @@ import io
 import json
 import math
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,22 +21,24 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
+
+@dataclass
+class ParseOutcome:
+    """解析结果：分块 + 原始字符数 + **要展示给用户**的警告（不是日志）。"""
+
+    chunks: list[Document]
+    char_count: int
+    warnings: list[str] = field(default_factory=list)
+
 # ---------------------------------------------------------------------------
 # 切分器延迟导入（冷启动性能的关键）
 # ---------------------------------------------------------------------------
 # `langchain_text_splitters` 的包 __init__ 会**立刻**导入
 # SentenceTransformersTokenTextSplitter，于是整个 sentence_transformers
-# （含 transformers / torch 以及全部 loss、trainer 子模块）被一起拉起来。
-# 实测：`import langchain_text_splitters` 冷启动约 9.5 秒，而
-# `import langchain_core.documents` 只要 0.12 秒。
-#
-# 本模块位于 `app.main` 的导入链上（main -> routers.documents -> services.loader），
-# 所以顶层导入它会把「端口开始监听」推迟到进程启动后 10 秒左右 ——
+# （含 transformers / torch 及全部子模块）被一起拉起来。
+# 本模块位于 `app.main` 的导入链上，顶层导入它会把「端口开始监听」推迟约 10 秒，
 # 用户看到的是浏览器 ERR_CONNECTION_REFUSED，误以为启动失败。
-#
-# 改成首次真正需要切分时才导入：导入 app.main 的耗时从 10.14s 降到 0.57s，
-# 而 sentence_transformers 本来就要在后台预热里加载，
-# 此时再补这个导入只要 0.23 秒（见 preload()）。
+# sentence_transformers 本来就要在后台预热里加载，那时补这个导入几乎不花时间。
 # ---------------------------------------------------------------------------
 _splitter_class: Any | None = None
 
@@ -54,16 +54,12 @@ def _get_splitter_class() -> Any:
 
 
 def preload() -> None:
-    """预热：把切分器依赖提前导入。
-
-    在后台初始化任务里、嵌入模型加载完成之后调用。那时 sentence_transformers
-    已经在内存里，补上这个导入几乎不花时间，用户第一次上传文档就不会卡顿。
-    """
+    """预热：把切分器依赖提前导入。在后台初始化任务里、嵌入模型加载完成之后调用。"""
     class_ = _get_splitter_class()
     logger.debug("文本切分器已就绪：%s", class_.__name__)
 
 
-# 中英文混合场景下的切分优先级：先按段落，再按句子，最后才按字符
+# 中英文混合场景下的切分优先级：先段落，再句子，最后才按字符
 _SEPARATORS = [
     "\n\n",
     "\n",
@@ -92,7 +88,7 @@ class DocumentParseError(RuntimeError):
 
 
 def build_splitter() -> Any:
-    """构造一个中文友好的递归字符切分器（延迟导入见文件头注释）。"""
+    """构造一个中文友好的递归字符切分器。"""
     return _get_splitter_class()(
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
@@ -114,38 +110,23 @@ def sha256_of(path: Path) -> str:
 # ---------------------------------------------------------------------------
 # 页眉 / 页脚（重复行）过滤
 # ---------------------------------------------------------------------------
-# 期刊论文、报告、试卷类 PDF 每一页都会重复同一段页眉：刊名、期号、栏目名。
-# 这些行在向量空间里是一份「关键词拼盘」——它同时含有刊名、栏目名、标题词，
-# 于是对**任何**提问都能拿到不低的相似度。实测本仓库 data 里的 4 页期刊论文：
-#
-#   Q「请总结这篇文档的主要内容」top-6 分数 = .433 .430 .374 .352 .333 .298
-#   其中 3 条都是同一段页眉在不同页上的副本，正文一条都没进来。
-#
-# 槽位被样板文本占满，模型自然「总结不出内容」。所以在切分之前，
-# 先把「出现在足够多页上的短行」整行删掉。
+# 期刊论文、报告类 PDF 每页都重复同一段页眉（刊名、期号、栏目名），它在向量空间里
+# 是一份「关键词拼盘」，对**任何**提问都能拿到不低的相似度，于是 top-k 槽位被样板
+# 文本占满、正文一条都进不来。所以在切分之前先把「出现在足够多页上的短行」删掉。
 _BOILERPLATE_MIN_PAGES = 3      # 页数太少时样本不足，容易误删正文
 _BOILERPLATE_PAGE_RATIO = 0.6   # 出现在 ≥60% 页面上才算页眉 / 页脚
 _BOILERPLATE_MAX_CHARS = 100    # 只把短行当样板；长段落重复更可能是正常引用
 
 
 def _normalize_line(line: str) -> str:
-    """归一化用于比对：**去掉**所有空白字符。
-
-    不能只折叠空白：同一段页眉在抽取结果里常常时有时无地多一个空格
-    （实测本仓库那篇期刊论文：奇数页是 `Communication 人工智能与识别技术`，
-    偶数页是 `Communication人工智能与识别技术`），只折叠的话两边仍然不相等，
-    重复行检测会整体失效。
-    """
+    """归一化用于比对：**去掉**所有空白字符（只折叠空白会因为时有时无的多余空格而失效）。"""
     return re.sub(r"\s+", "", line)
 
 
 def strip_repeated_lines(
     pages: list[tuple[str, dict[str, Any]]],
 ) -> tuple[list[tuple[str, dict[str, Any]]], int]:
-    """删除在多页上重复出现的短行（页眉 / 页脚 / 刊头）。
-
-    返回 ``(处理后的页, 删除的行数)``。页数少于 3 时直接原样返回。
-    """
+    """删除在多页上重复出现的短行（页眉 / 页脚 / 刊头），返回 ``(页, 删除行数)``；不足 3 页不处理。"""
     if len(pages) < _BOILERPLATE_MIN_PAGES:
         return pages, 0
 
@@ -178,16 +159,10 @@ def strip_repeated_lines(
 # ---------------------------------------------------------------------------
 # 版面还原：把 PDF 的硬换行补回段落边界
 # ---------------------------------------------------------------------------
-# PyPDF 抽出来的正文是「一行一行」的硬换行，段与段之间**没有空行**。
-# 递归切分器只能在 800 字处硬切，于是中文正文经常和英文摘要、上一节的开头
-# 粘进同一个块。实测那篇期刊论文：包含「1.1 多任务网络架构」的正文，
-# 因为前半段是英文摘要，对中文提问「多任务网络的优势是什么」的相似度
-# 从 0.367 掉到 0.147 —— 检索和总结同时变差。
-#
-# 这里用两条版面规则补回段落边界：
-#   * 小节标题（`0 引言` / `1.1 多任务网络架构` / `2.2.3 基于多任务网络…`）另起一段；
-#   * 中英文切换（中文正文接英文摘要、或反之）另起一段。
-# 切分器优先按空行切，于是分块自然对齐到小节，而不是对齐到第 800 个字。
+# PyPDF 抽出来的正文是硬换行，段与段之间**没有空行**，递归切分器只能在 800 字处硬切，
+# 于是中文正文常和英文摘要、上一节的开头粘进同一个块，检索与总结一起变差。
+# 两条版面规则补回段落边界：小节标题（`1.1 多任务网络架构`）另起一段；
+# 中英文切换（中文正文接英文摘要，或反之）另起一段。
 _CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 _SECTION_HEADING_RE = re.compile(r"^\d{1,2}(?:\.\d{1,2}){0,3}[\s、.]*\S")
@@ -216,7 +191,7 @@ def _switches_script(previous: str, current: str) -> bool:
 
 
 def insert_paragraph_breaks(text: str) -> str:
-    """给硬换行的 PDF 正文补回段落边界（见上文说明）。"""
+    """给硬换行的 PDF 正文补回段落边界。"""
     lines = (text or "").splitlines()
     out: list[str] = []
     last_content = ""
@@ -238,12 +213,9 @@ def insert_paragraph_breaks(text: str) -> str:
 # ---------------------------------------------------------------------------
 # 参考文献列表
 # ---------------------------------------------------------------------------
-# 参考文献是「关键词最密集、语义最贫乏」的文本：条目标题里塞满了主题词，
-# 于是对**任何**提问的相似度都不低。实测那篇期刊论文：
-#   Q「请总结这篇文档的主要内容」→ 参考文献块 0.420（全场第一）
-#   Q「多任务网络的优势是什么」  → 参考文献块 0.309（挤掉正文槽位）
-# 而它提供不了任何可用信息。识别到「参考文献 / References」这种独占一行的
-# 标题、且后面确实是编号条目时，直接截掉。
+# 参考文献是「关键词最密集、语义最贫乏」的文本，条目标题塞满主题词，对**任何**提问
+# 相似度都不低，却提供不了可用信息，还会挤掉正文槽位。识别到「参考文献 / References」
+# 独占一行的标题、且后面确实是编号条目时，直接截掉。
 _REFERENCE_HEADINGS = {
     "参考文献",
     "参考文献:",
@@ -265,9 +237,7 @@ def strip_reference_sections(
     pages: list[tuple[str, dict[str, Any]]],
 ) -> tuple[list[tuple[str, dict[str, Any]]], int]:
     """截掉「参考文献」及其后内容，返回 ``(处理后的页, 截掉的行数)``。
-
-    只有在标题后面确实跟着至少两条编号条目时才动手，避免把正文里
-    顺口提一句「参考文献」的段落也误删。
+    标题后必须确实跟着至少两条编号条目才动手，避免误删正文里顺口提一句的段落。
     """
     cleaned: list[tuple[str, dict[str, Any]]] = []
     removed = 0
@@ -288,6 +258,34 @@ def strip_reference_sections(
         removed += len(lines) - cut
         cleaned.append(("\n".join(lines[:cut]), meta))
     return cleaned, removed
+
+
+# ---------------------------------------------------------------------------
+# 抽取质量体检（扫描件 / 图片版 PDF）
+# ---------------------------------------------------------------------------
+# 扫描版 PDF 没有文字层，PyPDF 抽出来是空的或只有零星几个字符；结论必须做成结构化
+# 警告带到上传结果与文档列表上，否则用户看到「索引完成」却永远检索不到东西。
+_MIN_PAGES_FOR_EXTRACTION_CHECK = 3
+
+
+def low_extraction_warning(
+    pages: list[tuple[str, dict[str, Any]]],
+) -> str | None:
+    """多页文档平均每页抽取字符数过低 → 返回给用户看的警告文案；少于 3 页不判断。"""
+    if len(pages) < _MIN_PAGES_FOR_EXTRACTION_CHECK:
+        return None
+
+    extracted = sum(len(content or "") for content, _meta in pages)
+    per_page = extracted / len(pages)
+    threshold = settings.pdf_min_chars_per_page
+    if per_page >= threshold:
+        return None
+
+    return (
+        f"疑似扫描件 / 图片版 PDF：{len(pages)} 页平均只抽取到 {per_page:.0f} 个字符"
+        f"（低于 {threshold}）。正文很可能根本没有文字层，检索将查不到这份文档的内容。"
+        "建议改用文字版 PDF，或先用 OCR 工具把图片转成文字再上传。"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -361,11 +359,8 @@ def parse_document(
     path: Path,
     doc_id: str,
     original_filename: str,
-) -> tuple[list[Document], int]:
-    """解析文件并切分为 chunk。
-
-    返回 ``(chunks, 原始字符数)``。
-    """
+) -> ParseOutcome:
+    """解析文件并切分为 chunk，返回 :class:`ParseOutcome`（含面向用户的警告）。"""
     ext = path.suffix.lower()
     parser = _PARSERS.get(ext)
     if parser is None:
@@ -394,18 +389,12 @@ def parse_document(
         if dropped_refs:
             logger.info("截掉参考文献列表：%s 共 %d 行", original_filename, dropped_refs)
 
-    # 抽取质量体检：多页 PDF 平均每页字符数过低，通常意味着扫描件/图片版，
-    # 此时检索不出内容不是检索的问题，而是压根没抽到文本，要明确告诉用户。
-    if len(raw_parts) >= 3:
-        extracted = sum(len(content or "") for content, _ in raw_parts)
-        per_page = extracted / len(raw_parts)
-        if per_page < 120:
-            logger.warning(
-                "%s 平均每页仅抽取到 %.0f 字符，可能是扫描件或图片版 PDF，"
-                "正文无法检索；建议改用文字版 PDF",
-                original_filename,
-                per_page,
-            )
+    # 抽取质量体检：多页 PDF 平均每页字符数过低，通常意味着扫描件/图片版。
+    warnings: list[str] = []
+    low_extraction = low_extraction_warning(raw_parts)
+    if low_extraction:
+        warnings.append(low_extraction)
+        logger.warning("%s：%s", original_filename, low_extraction)
 
     base_meta: dict[str, Any] = {
         "doc_id": doc_id,
@@ -424,7 +413,12 @@ def parse_document(
         documents.append(Document(page_content=content, metadata={**base_meta, **extra}))
 
     if not documents:
-        raise DocumentParseError(f"{original_filename} 中没有可索引的文本内容")
+        # 「抽不到文本」和「文件本身是空的」提示必须分开：前者要 OCR，后者要检查文件。
+        hint = low_extraction or (
+            "文件里没有可索引的文本内容。若这是扫描件或图片版 PDF，"
+            "请先用 OCR 工具转成文字再上传。"
+        )
+        raise DocumentParseError(f"{original_filename} 中没有可索引的文本内容：{hint}")
 
     splitter = build_splitter()
     chunks = splitter.split_documents(documents)
@@ -441,7 +435,7 @@ def parse_document(
         counter[key] = idx + 1
 
         page = chunk.metadata.get("page")
-        page_no = int(page) + 1 if isinstance(page, int) else None  # PyPDF 从 0 开始
+        page_no = int(page) + 1 if isinstance(page, int) else None  # PyPDF 页码从 0 开始
 
         chunk.metadata.update(
             {
@@ -455,9 +449,12 @@ def parse_document(
         cleaned.append(chunk)
 
     if not cleaned:
-        raise DocumentParseError(f"{original_filename} 文本过短，无法生成有效分块")
+        raise DocumentParseError(
+            f"{original_filename} 文本过短，无法生成有效分块"
+            + (f"：{low_extraction}" if low_extraction else "")
+        )
 
     logger.info(
         "解析完成：%s -> %d chunks / %d chars", original_filename, len(cleaned), total_chars
     )
-    return cleaned, total_chars
+    return ParseOutcome(chunks=cleaned, char_count=total_chars, warnings=warnings)

@@ -1,19 +1,9 @@
-"""最小化的 Ollama 协议兼容服务（仅用于测试）。
+"""最小化的 Ollama 协议兼容服务（仅用于测试）。按 Ollama 的线格式实现
+`/api/tags`、`/api/version`、`/api/chat`，让 ChatOllama 真实发起请求并解析流式
+响应，验证集成代码而不是用 mock 换掉整层。
 
-为什么需要它
-------------
-在没法安装真实 Ollama 的环境里，`langchain-ollama` → `ollama` Python 客户端
-→ HTTP 这一整条链路是唯一没有被覆盖的部分。本模块实现了 Ollama 的
-`/api/tags`、`/api/version`、`/api/chat` 三个接口的**线格式**，
-让 ChatOllama 能够真实地发起请求、解析流式响应，
-从而验证集成代码（而不是用 mock 把整层换掉）。
-
-用法：
-    # 独立运行（默认 11434 端口）
-    .venv\\Scripts\\python.exe tests\\fake_ollama.py --port 11434
-
-    # 在测试中以线程方式启动
-    from tests.fake_ollama import start_fake_ollama
+    .venv\\Scripts\\python.exe tests\\fake_ollama.py   # 独立运行
+    from tests.fake_ollama import start_fake_ollama   # 测试中以线程启动
 """
 
 from __future__ import annotations
@@ -57,8 +47,7 @@ class _Handler(BaseHTTPRequestHandler):
     pieces = DEFAULT_PIECES
     model = MODEL_NAME
     fail_with = None  # 设为整数则返回该状态码，用于测试错误分支
-    # 模型能力：rag.py 会先查 /api/show 的 capabilities，确认支持 thinking
-    # 才在 ChatOllama 上打开原生思维链通道
+    # rag.py 先查 /api/show 的 capabilities，确认支持 thinking 才开原生思维链通道
     capabilities = ["completion", "tools", "thinking"]
     # 记录最近一次 /api/generate 的请求体：用于断言「预热」与「退出卸载」
     last_generate_payload = None
@@ -119,8 +108,7 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._once_chat()
         elif self.path.startswith("/api/show"):
-            # 只实现 capabilities —— 真实 Ollama 还返回 modelfile / details 等，
-            # 本项目只关心「支不支持原生 thinking 通道」。
+            # 只实现 capabilities —— 真实 Ollama 还返回 modelfile / details 等
             self._json({
                 "model": self.model,
                 "capabilities": list(self.capabilities),
@@ -164,12 +152,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         def write_chunk(payload: bytes) -> None:
-            """写一个 HTTP chunk。
-
-            注意：NDJSON 的换行必须属于**载荷本身**。
-            如果只在 chunk 后面写 CRLF，那只是分块分隔符，
-            客户端会看到两个 JSON 对象连在一起，报 "Extra data"。
-            """
+            """写一个 HTTP chunk；NDJSON 的换行必须属于载荷本身。"""
             data = payload + b"\n"
             self.wfile.write(f"{len(data):X}\r\n".encode())
             self.wfile.write(data)

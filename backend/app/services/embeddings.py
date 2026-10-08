@@ -1,13 +1,5 @@
-"""Embeddings 服务：本地加载 all-MiniLM-L6-v2（HuggingFace / sentence-transformers）。
-
-设计要点
---------
-1. **完全离线**：优先从 ``models/all-MiniLM-L6-v2`` 本地目录加载，
-   配合 ``HF_HUB_OFFLINE=1`` 保证进程不做任何网络请求。
-2. **懒加载 + 线程安全**：首次使用时才载入模型（约 2~4 秒），
-   之后复用同一个实例，避免每次请求重复占用内存。
-3. **向量归一化**：开启 ``normalize_embeddings``，使 FAISS 的内积等价于余弦相似度，
-   分数区间落在 [-1, 1]，便于设置阈值与展示。
+"""Embeddings 服务：本地离线加载嵌入模型，懒加载 + 线程安全。
+``normalize_embeddings`` 使 FAISS 内积等价于余弦相似度。
 """
 
 from __future__ import annotations
@@ -24,6 +16,13 @@ logger = get_logger(__name__)
 _lock = threading.Lock()
 _instance: Any | None = None
 _load_error: str | None = None
+#: 模型**实际**输出的向量维度（载入后探测得到）。
+#: 不能用 settings.embedding_dimension：那是手写声明值，换模型忘了同步就会与实际不符，
+#: 而索引一致性判断完全依赖这个数字。
+_dimension: int | None = None
+
+#: 探测维度用的文本，只是为了让模型跑一次前向。
+_DIMENSION_PROBE = "维度探测"
 
 
 class EmbeddingNotReadyError(RuntimeError):
@@ -31,6 +30,7 @@ class EmbeddingNotReadyError(RuntimeError):
 
 
 def _build() -> Any:
+    global _dimension
     # 延迟导入：确保 app.config 已经设置好离线环境变量
     from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -60,6 +60,25 @@ def _build() -> Any:
 
     elapsed = time.perf_counter() - started
     logger.info("嵌入模型加载完成，耗时 %.2fs", elapsed)
+
+    # 立刻探测真实维度（一次前向）。不要省掉：换模型后维度与旧索引不一致时，
+    # FAISS 只会抛一句看不出原因的断言错误。
+    try:
+        _dimension = len(embeddings.embed_query(_DIMENSION_PROBE))
+    except Exception as exc:  # noqa: BLE001 - 探测失败不影响基本使用
+        _dimension = None
+        logger.warning("嵌入模型维度探测失败（忽略）：%s", exc)
+        return embeddings
+
+    logger.info("嵌入模型实际维度：%d", _dimension)
+    if _dimension != settings.embedding_dimension:
+        logger.warning(
+            "配置 RAG_EMBEDDING_DIMENSION=%d 与模型实际维度 %d 不一致。"
+            "程序按实际维度工作，但建议把配置改成 %d（或留空由程序推导）。",
+            settings.embedding_dimension,
+            _dimension,
+            _dimension,
+        )
     return embeddings
 
 
@@ -83,11 +102,28 @@ def get_embeddings() -> Any:
 
 
 def try_get_embeddings() -> Any | None:
-    """健康检查用：加载失败时返回 None 而不是抛异常。"""
+    """加载失败时返回 None 而不是抛异常（体检用）；体检报告不该整体变成 500。"""
     try:
         return get_embeddings()
     except Exception:  # noqa: BLE001
         return None
+
+
+def loaded_dimension() -> int | None:
+    """已载入模型的实际向量维度；尚未载入或探测失败时为 None。"""
+    return _dimension
+
+
+def reset_instance() -> None:
+    """丢弃已加载的模型，让下次调用重新加载。
+    运行期换模型必须调用：不丢的话向量化继续用旧模型，而一致性检查还以为一切正常。
+    """
+    global _instance, _load_error, _dimension
+    with _lock:
+        _instance = None
+        _load_error = None
+        _dimension = None
+    logger.info("嵌入模型实例已重置，下次使用时重新加载")
 
 
 def warmup() -> bool:
@@ -109,6 +145,9 @@ def embedding_status() -> dict[str, Any]:
         "local_ready": settings.is_embedding_ready(),
         "loaded": _instance is not None,
         "device": settings.embedding_device,
+        # dimension 是配置声明的，actual_dimension 是模型真实输出的；两者不一致
+        # 说明索引可能被记成错误的维度，界面要能看出来。
         "dimension": settings.embedding_dimension,
+        "actual_dimension": _dimension,
         "error": _load_error,
     }

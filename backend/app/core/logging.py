@@ -16,12 +16,8 @@ _FORMAT = "%(asctime)s | %(levelname)-7s | %(name)-28s | %(message)s"
 def _ensure_utf8_streams() -> None:
     """让中文日志在「控制台 / 管道 / 重定向」下都能正确输出。
 
-    * 直接连到 Windows 控制台时，``sys.stdout.encoding`` 已经是 ``utf-8``
-      （Python 自己负责转成 UTF-16 写控制台），此时不能改，改了反而会乱码。
-    * 输出被管道或重定向时，编码会退回系统 ANSI 代码页（中文 Windows 上是 cp936），
-      下游若按 UTF-8 读取就是一片乱码。这里统一改成 UTF-8。
-
-    这正是「启动脚本一跑满屏乱码」的根因所在。
+    直连控制台时 ``sys.stdout.encoding`` 已是 utf-8，改了反而乱码；被管道或重定向时
+    编码会退回系统 ANSI 代码页（中文 Windows 上是 cp936），下游按 UTF-8 读就是乱码。
     """
     for stream in (sys.stdout, sys.stderr):
         if stream is None:
@@ -32,7 +28,7 @@ def _ensure_utf8_streams() -> None:
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError, OSError):
-            # 某些被包装过的流不支持 reconfigure，忽略即可，不影响主流程
+            # 被包装过的流可能不支持 reconfigure，忽略即可
             pass
 
 

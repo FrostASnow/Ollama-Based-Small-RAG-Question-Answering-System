@@ -1,14 +1,9 @@
 @echo off
 rem ===========================================================================
 rem  Offline RAG Document QA -- launcher
-rem
-rem  Double-click this file to start Ollama + backend + frontend.
-rem
-rem  IMPORTANT: keep this file ASCII-only.
-rem  cmd.exe reads .cmd files using the OEM code page (936 on Chinese Windows).
-rem  UTF-8 Chinese text gets re-grouped byte-wise into different characters,
-rem  which shreds comment lines and makes cmd try to execute the fragments.
-rem  All Chinese messages are produced by start.ps1 instead.
+rem  Double-click to start Ollama + backend + frontend.
+rem  IMPORTANT: keep this file ASCII-only -- cmd.exe reads .cmd with the OEM code page
+rem  (936), so UTF-8 Chinese comments get shredded and executed as commands.
 rem ===========================================================================
 setlocal
 cd /d "%~dp0.."

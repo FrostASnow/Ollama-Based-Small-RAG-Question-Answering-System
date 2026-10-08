@@ -1,21 +1,8 @@
 ﻿# ============================================================================
 #  prepare.ps1 —— 一次性联网准备（之后即可完全离线运行）
 #
-#  做四件事：
-#    1. 准备 Python 3.12 运行时（优先用 uv，其次用系统已装的 Python）
-#    2. 创建 .venv 并安装全部 Python 依赖
-#    3. 下载 all-MiniLM-L6-v2 嵌入模型到 models/
-#    4. 下载便携版 Ollama 到 tools/ollama 并拉取 LLM 模型
-#
-#  推荐用法：直接双击 scripts\prepare.cmd
-#
-#  也可以命令行运行：
-#    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\prepare.ps1
-#    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\prepare.ps1 -Mirror
-#    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\prepare.ps1 -SkipOllama
-#    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\prepare.ps1 -LlmModel llama3.2
-#
-#  说明：脚本默认从项目根目录定位路径，无论从哪个目录执行都可以。
+#  用法：双击 scripts\prepare.cmd，或
+#    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\prepare.ps1 [-Mirror] [-SkipOllama]
 # ============================================================================
 
 [CmdletBinding()]
@@ -30,10 +17,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-# ---------------------------------------------------------------------------
 # 控制台编码：必须最先执行，否则下面的中文提示全是乱码
-# （原理见 start.ps1 里的同名代码块）
-# ---------------------------------------------------------------------------
 try {
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -48,9 +32,6 @@ $OllamaExe   = Join-Path $OllamaDir 'ollama.exe'
 $ModelsDir   = Join-Path $ProjectRoot 'models\ollama'
 $ReqFile     = Join-Path $ProjectRoot 'backend\requirements.txt'
 
-# 便携版 Ollama 的完整性工具（Test-OllamaPayload / Test-ZipReadable /
-# Stop-PortableOllama / Remove-OllamaDir）。同一份也被 start.ps1 点源，
-# 并被 tests\run_all.ps1 的预检直接调用做真实回归测试。
 . (Join-Path $PSScriptRoot 'lib\ollama-runtime.ps1')
 
 function Write-Step($text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan }
@@ -58,26 +39,9 @@ function Write-Ok($text)   { Write-Host "[OK]   $text" -ForegroundColor Green }
 function Write-Warn2($text){ Write-Host "[WARN] $text" -ForegroundColor Yellow }
 function Write-Err($text)  { Write-Host "[FAIL] $text" -ForegroundColor Red }
 
-# ---------------------------------------------------------------------------
-# 通用下载
-# ---------------------------------------------------------------------------
-# 顺序：node + fetch.mjs  →  curl  →  Invoke-WebRequest
-#
-# 为什么把 node 放第一位：
-#   * fetch.mjs 的进度是干净的单行（用 \r 原地刷新），网页日志里能正常显示
-#   * 它支持断点续传 —— 1.4GB 的文件中断一次不用从头再来
-# curl 放到其后，并且必须加 -sS：
-#   默认的进度表用 \r 高频重绘，落到日志文件里就是成百上千行 "0 0 0 0 0"，
-#   既是噪音又拖慢前端渲染。-s 关掉进度，-S 保留错误信息。
-#
-# Validator：给一个「文件是否已经可用」的判定脚本块。
-#   存在且通过校验 → 跳过；存在但没通过 → **保留文件继续下载**（fetch.mjs 会从
-#   .part 断点续传），而不是删掉重来。1.4GB 的下载重来一次代价太大。
-#
-# GithubAsset*：走 fetch.mjs 的 --github-asset 模式（用 api.github.com 解析出
-#   带签名的真实地址）。**这条路径很重要**：有些网络里 github.com 本身被屏蔽，
-#   但 api.github.com 与 release-assets.githubusercontent.com 可用。
-# ---------------------------------------------------------------------------
+# 下载顺序 node+fetch.mjs → curl → Invoke-WebRequest：node 支持断点续传且进度干净；curl 必须带 -sS
+# （默认进度表会把日志刷成成百上千行噪音）。部分网络屏蔽 github.com 但 api.github.com 可用，
+# 故保留 --github-asset 路径；Validator 不通过时保留原文件续传，不删掉重下。
 function Get-RemoteFile {
     param(
         [string]$Url,
@@ -143,15 +107,8 @@ function Get-RemoteFile {
     return $false
 }
 
-# ---------------------------------------------------------------------------
-# 定位 uv
-# ---------------------------------------------------------------------------
-# 注意：Get-Command 返回的是 ApplicationInfo，路径在 .Source 上，
-# **没有 .FullName 属性** —— 误用会静默拿到空字符串，导致后面整段逻辑
-# 悄悄走到「没有 uv」的分支（曾因此回退到 python -m pip，
-# 而 uv 创建的 venv 默认不含 pip，直接报 "No module named pip"）。
-# 这里统一解析成字符串路径，并额外覆盖几个常见安装位置。
-# ---------------------------------------------------------------------------
+# 定位 uv：Get-Command 返回 ApplicationInfo，路径在 .Source，没有 .FullName ——
+# 误用会静默拿到空字符串，一路走进「没有 uv」分支（而 uv 建的 venv 默认不含 pip）。
 function Resolve-Uv {
     $cmd = Get-Command uv -ErrorAction SilentlyContinue
     if ($cmd) {
@@ -173,15 +130,8 @@ function Resolve-Uv {
     return $null
 }
 
-# ---------------------------------------------------------------------------
-# 安全地运行「预期可能失败」的原生命令
-# ---------------------------------------------------------------------------
-# PowerShell 5.1 的坑：当 $ErrorActionPreference = 'Stop' 时，
-# 只要把原生命令的 stderr 做了重定向（`*> $null` 或 `2>&1`），
-# PowerShell 就会抛出 NativeCommandError 并把整个脚本打断。
-# 而「探测 pip 在不在」这类操作恰恰既需要重定向、又预期会失败。
-# 这个函数临时放宽偏好设置，只把退出码告诉我们。
-# ---------------------------------------------------------------------------
+# PS 5.1 在 $ErrorActionPreference='Stop' 下，只要重定向原生命令的 stderr（*> $null / 2>&1）
+# 就会抛 NativeCommandError 打断脚本 —— 而探测「pip 在不在」恰恰既需重定向又预期失败。
 function Test-NativeSuccess {
     param([string]$Exe, [string[]]$Arguments)
 
@@ -197,15 +147,8 @@ function Test-NativeSuccess {
     }
 }
 
-# ---------------------------------------------------------------------------
-# Ollama 安装完整性：判定函数在 scripts\lib\ollama-runtime.ps1（已点源）
-# ---------------------------------------------------------------------------
-# 便携版 zip 里除了 ollama.exe，还有 lib\ollama\ 下一整套推理运行时。
-# 解压中断时可能**只留下一个 ollama.exe**，而它的故障表现极具欺骗性：
-#     ollama serve 正常启动、/api/tags 也能列出模型 ——
-#     唯独真正提问时报 "error starting llama-server: llama-server binary not found"。
-# 所以这里显式校验，发现不完整就清掉重来，而不是看到 ollama.exe 就说「已就绪」。
-# ---------------------------------------------------------------------------
+# 便携版 zip 除 ollama.exe 还有 lib\ollama\ 整套推理运行时：解压中断留下的半成品能 serve、
+# 能列出模型，唯独提问报 "llama-server binary not found"，所以必须显式校验。
 
 Write-Host @"
 ============================================================================
@@ -217,9 +160,6 @@ Write-Host @"
 ============================================================================
 "@ -ForegroundColor White
 
-# ---------------------------------------------------------------------------
-# 1. Python 运行时
-# ---------------------------------------------------------------------------
 if (-not $SkipPython) {
     Write-Step '1/4 准备 Python 运行时'
 
@@ -233,11 +173,8 @@ if (-not $SkipPython) {
     } else {
         Write-Ok "找到 uv：$uvPath"
 
-        # uv 默认把缓存放在 %LOCALAPPDATA%\uv\cache。
-        # 在部分受限机器上该目录不可写，uv 会直接以
-        # "Failed to initialize cache ... 拒绝访问" 失败，而后续的 pip 回退
-        # 又因为 venv 里没有 pip 而一起失败 —— 用户看到的是一串莫名其妙的报错。
-        # 这里先探测一次，不可写就改用项目内的目录。
+        # uv 默认缓存在 %LOCALAPPDATA%\uv\cache，受限机器上该目录不可写会让 uv 直接失败，
+        # 而后续 pip 回退又因 venv 没 pip 一起失败 —— 先探测，不可写就改用项目内目录。
         if (-not $env:UV_CACHE_DIR) {
             $defaultCache = Join-Path $env:LOCALAPPDATA 'uv\cache'
             $cacheUsable = $true
@@ -263,8 +200,7 @@ if (-not $SkipPython) {
             Write-Host '  使用 uv 安装 Python 3.12 ...'
             & $uvPath python install 3.12
             Write-Host '  创建虚拟环境 .venv ...'
-            # --seed 让 venv 自带 pip/setuptools：
-            # 没有 pip 的 venv 会让「回退到 python -m pip」彻底走不通
+            # --seed 让 venv 自带 pip/setuptools：没有 pip 的 venv 会让回退到 pip 彻底走不通
             & $uvPath venv --seed --python 3.12 $VenvDir
         } else {
             $sysPy = $null
@@ -292,9 +228,6 @@ if (-not $SkipPython) {
     Write-Step '1/4 跳过 Python 准备'
 }
 
-# ---------------------------------------------------------------------------
-# 2. 安装依赖
-# ---------------------------------------------------------------------------
 Write-Step '2/4 安装 Python 依赖'
 
 $uvCmd = Resolve-Uv
@@ -310,9 +243,8 @@ if ($uvCmd) {
 }
 
 if (-not $depsOk) {
-    # 关键兜底：uv 创建的虚拟环境默认不带 pip。
-    # 如果这时再直接 `python -m pip`，只会得到 "No module named pip" 这种
-    # 让人摸不着头脑的报错，所以先用 ensurepip 把 pip 引导出来。
+    # 兜底：uv 建的 venv 默认不带 pip，直接 `python -m pip` 只会报 "No module named pip"，
+    # 所以先用 ensurepip 把 pip 引导出来。
     if (-not (Test-NativeSuccess $VenvPython @('-m', 'pip', '--version'))) {
         Write-Host '  虚拟环境中没有 pip，正在引导 ...' -ForegroundColor Gray
         & $VenvPython -m ensurepip --upgrade
@@ -337,9 +269,6 @@ if (-not $depsOk) {
 }
 Write-Ok '依赖安装完成'
 
-# ---------------------------------------------------------------------------
-# 3. 嵌入模型
-# ---------------------------------------------------------------------------
 Write-Step '3/4 下载嵌入模型'
 
 $dlArgs = @((Join-Path $PSScriptRoot 'download_models.py'), '--model', $EmbeddingModel)
@@ -352,27 +281,15 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# ---------------------------------------------------------------------------
-# 4. Ollama
-# ---------------------------------------------------------------------------
 if ($SkipOllama) {
     Write-Step '4/4 跳过 Ollama'
     Write-Warn2 ' 未准备 LLM。请自行安装 Ollama 并执行： ollama pull ' + $LlmModel
 } else {
     Write-Step '4/4 准备 Ollama 与 LLM 模型'
 
-    # 先体检：只认「有推理引擎」的安装，避免把半个包当成已就绪。
-    #
-    # 这里踩过一次真实的坑：ollama.exe 正在运行的话，Windows **不允许删除**它，
-    # 原来的 `Remove-Item ... -ErrorAction SilentlyContinue` 会静默失败，
-    # 紧接着 `Test-Path $OllamaExe` 仍然为真，于是脚本认定「已经装好了」，
-    # 一路 [OK] 并以退出码 0 结束 —— 用户看到「一键安装成功」，
-    # 但坏文件一个都没换掉（本项目的真实故障就是这么来的）。
-    #
-    # 现在的顺序是「先下载、后替换」：
-    #   1. 只**标记**需要重装，先不动现有文件 —— 万一 1.4GB 下载失败，
-    #      用户手上那个（虽然不完整的）Ollama 原封不动，不会更糟；
-    #   2. 下载并校验 zip 成功之后，才停进程 → 删除 → 解压 → 再校验。
+    # 先体检：只认「有推理引擎」的安装。Windows 不允许删除正在运行的程序：Remove-Item 会静默
+    # 失败、Test-Path 仍为真，脚本于是误判「已装好」并报成功。所以「先下载、后替换」——
+    # 只标记待重装，下载并校验成功后，才停进程 → 删除 → 解压 → 再校验。
     $portableIncomplete = (Test-Path $OllamaExe) -and -not (Test-OllamaPayload $OllamaDir)
     $portableWasRunning = $false
 
@@ -386,7 +303,7 @@ if ($SkipOllama) {
     $useSystemOllama = $false
 
     if ($needPortableInstall -and -not $portableIncomplete) {
-        # 完全没有 ollama.exe 时，系统里已有现成的就用现成的，不必下载 1.4GB
+        # 完全没有 ollama.exe 时，系统里已有现成的就用现成的，不必再下载整个便携版
         $sysOllama = Get-Command ollama -ErrorAction SilentlyContinue
         if ($sysOllama) {
             Write-Ok " 使用系统已安装的 Ollama：$($sysOllama.Source)"
@@ -406,13 +323,8 @@ if ($SkipOllama) {
             Write-Host '  未找到 Ollama，下载便携版（免安装、免管理员）...'
         }
 
-        # 多个下载源，按「实测最快/最可用」排序依次尝试。
-        #
-        # 本机实测（同一个网络环境下）：
-        #   github.com 直连                → 连接被重置，不可用
-        #   api.github.com 解析出的签名地址 → 3.0 MB/s（1.36GB 约 8 分钟）
-        #   ghproxy.net 镜像               → 291 KB/s（约 82 分钟）
-        # 所以默认先走 API 解析这条路；-Mirror 则把镜像提到最前面。
+        # 多个下载源依次尝试：默认先走 API 解析（部分网络屏蔽 github.com 直连），
+        # -Mirror 则把镜像提到最前面。
         $directUrl = 'https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip'
         $apiSource = @{
             Label = 'GitHub API 解析（api.github.com → release-assets）'
@@ -437,8 +349,7 @@ if ($SkipOllama) {
 
         $zipPath = Join-Path $ProjectRoot 'tools\ollama-windows-amd64.zip'
         $partPath = "$zipPath.part"
-        # Validator：只有「能打开中央目录」的 zip 才算下载完成。
-        # 没下完的 zip 留着让 fetch.mjs 走 .part 续传，而不是删掉重来。
+        # 只有能打开中央目录的 zip 才算下载完成；没下完的留着让 fetch.mjs 从 .part 续传。
         $zipOk = { param($path) Test-ZipReadable -Path $path }
 
         $downloaded = $false
@@ -578,16 +489,8 @@ if ($SkipOllama) {
         Write-Host '  这不影响使用，但拷贝到离线机器前请确认模型目录。' -ForegroundColor Yellow
     }
 
-    # 必须把本脚本启动的 Ollama 收掉，不能留着它跑。
-    #
-    # 原因是一个很隐蔽的 Windows 行为（实测）：子进程只要还活着，并且与
-    # 本进程共享同一个控制台，**powershell.exe 就不会退出** ——
-    # 脚本明明已经跑完最后一行，宿主进程却一直挂着。对「一键安装」来说这是
-    # 致命的：「安装」日志俱全、退出码却永远不返回，网页上就一直停在「安装中…」。
-    # （实测：把子进程杀掉，挂着的宿主立刻退出。）
-    #
-    # 所以这里照旧停掉它，并明确告诉用户怎么再拉起来 —— start.ps1 会在启动
-    # 后端之前按需拉起 Ollama，所以再运行一次 start.cmd 就够了。
+    # 必须把本脚本启动的 Ollama 收掉：子进程还活着且与本进程共享同一个控制台时，
+    # powershell.exe 不会退出（日志俱全、退出码永不返回）。start.ps1 会按需拉起 Ollama。
     if ($startedHere) {
         Write-Host '  停止临时启动的 Ollama 服务'
         Get-Process -Name 'ollama' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -599,13 +502,8 @@ if ($SkipOllama) {
     }
 }
 
-# ---------------------------------------------------------------------------
-# 自检
-# ---------------------------------------------------------------------------
-# 依赖导入 + 便携版 Ollama 完整性。后者必须放在这里：
-# 半成品会在「准备完成、退出码 0」之后才在提问时暴露，用户完全无从判断，
-# 而这个脚本是唯一能在安装阶段就把它抓住的地方。
-# ---------------------------------------------------------------------------
+# 自检：依赖导入 + 便携版 Ollama 完整性。半成品只会在提问时才暴露，
+# 这里是唯一能在安装阶段抓住它的地方。
 Write-Step '自检'
 & $VenvPython (Join-Path $ProjectRoot 'tests\check_imports.py')
 $importOk = ($LASTEXITCODE -eq 0)
@@ -625,8 +523,7 @@ if (-not $SkipOllama -and (Test-Path $OllamaExe) -and -not (Test-OllamaPayload $
 }
 
 Write-Step '一体化启动器（RAG-QA.exe）'
-# 有 .NET Framework 的 csc.exe 就顺手编译启动器，用户双击它即可启动/停止。
-# 失败不是致命问题：仍然可以用 start.cmd / stop.cmd。
+# 有 csc.exe 就顺手编译启动器；失败不致命，仍可用 start.cmd / stop.cmd。
 try {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build-launcher.ps1') *> $null
     if ($LASTEXITCODE -eq 0 -and (Test-Path (Join-Path $ProjectRoot 'RAG-QA.exe'))) {

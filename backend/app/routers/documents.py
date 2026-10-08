@@ -21,7 +21,7 @@ from app.services.ingest import (
 )
 from app.services.loader import DocumentParseError, UnsupportedFileTypeError
 from app.services.registry import registry
-from app.services.vectorstore import vector_store
+from app.services.vectorstore import IndexIncompatibleError, vector_store
 
 logger = get_logger(__name__)
 
@@ -55,16 +55,15 @@ async def upload_documents(files: list[UploadFile] = File(...)) -> list[UploadRe
         try:
             path, original, size = await save_upload(upload)
             info, duplicated = ingest_path(path, original, size)
-            results.append(
-                UploadResponse(
-                    document=info,
-                    message=(
-                        f"《{original}》内容已存在，复用已有索引"
-                        if duplicated
-                        else f"《{original}》索引完成，共 {info.chunk_count} 个分块"
-                    ),
-                )
-            )
+            if duplicated:
+                message = f"《{original}》内容已存在，复用已有索引"
+            else:
+                message = f"《{original}》索引完成，共 {info.chunk_count} 个分块"
+            # 解析警告必须出现在用户看得到的地方（上传结果就是第一现场）：
+            # 只在日志里 warning 一句，用户只会看到「索引完成」。
+            if info.warnings:
+                message += "；⚠ " + "；".join(info.warnings)
+            results.append(UploadResponse(document=info, message=message))
         except (IngestError, UnsupportedFileTypeError, DocumentParseError) as exc:
             logger.warning("入库失败 %s：%s", name, exc)
             results.append(
@@ -106,7 +105,6 @@ async def upload_documents(files: list[UploadFile] = File(...)) -> list[UploadRe
                 )
             )
 
-    # 只要有文件成功入库就落一次盘
     vector_store.persist()
     return results
 
@@ -132,18 +130,23 @@ async def document_chunks(doc_id: str, limit: int = 50) -> dict[str, object]:
 def reindex_documents() -> dict[str, object]:
     """按当前的解析 / 切分 / 页眉过滤配置，用原文件重建整个索引。
 
-    同步函数：解析 + 向量化是 CPU 密集的阻塞操作，交给 FastAPI 的线程池执行，
+    同步函数：解析 + 向量化是阻塞的 CPU 操作，交给 FastAPI 的线程池执行，
     避免卡住事件循环（否则重建期间前端连健康检查都拿不到响应）。
     """
     if not registry.all():
         raise HTTPException(status_code=409, detail="知识库为空，无需重建")
-    report = reindex_all()
+    try:
+        report = reindex_all()
+    except IndexIncompatibleError as exc:  # pragma: no cover - 正常会自动整体重建
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     logger.info(
-        "重建索引完成：%s 个文档 / %s 块 -> %s 块（失败 %s）",
+        "重建索引完成：%s 个文档 / %s 块 -> %s 块（失败 %s，索引状态 %s，备份 %s）",
         report["documents"],
         report["chunks_before"],
         report["chunks_after"],
         report["failed"],
+        report.get("index_state_before"),
+        report.get("backup_dir") or "无",
     )
     return report
 

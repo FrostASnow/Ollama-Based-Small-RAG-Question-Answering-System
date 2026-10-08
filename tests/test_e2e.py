@@ -1,14 +1,6 @@
-"""端到端集成测试（不需要 Ollama）。
-
-用真实的向量库、真实的注册表、真实的 RAG 服务，只把 LLM 换成一个可控的假模型，
-从而在**没有 Ollama** 的情况下也能验证：
-
-    * 文档入库 → 切分 → 向量化 → FAISS 持久化 → 注册表
-    * 检索是否按预期召回
-    * 流式事件序列（meta / thinking / token / sources / done）
-    * 推理链标签在**逐 token 被打碎**时能否被正确剥离
-    * 引用编号 [n] 的提取
-    * 无召回时的兜底回答
+"""端到端集成测试（不需要 Ollama）。用真实向量库 / 注册表 / RAG 服务，只把 LLM
+换成可控假模型：入库→切分→向量化→FAISS→注册表、检索召回、流式事件序列、
+推理链剥离、引用编号与兜底回答。
 
     .venv\\Scripts\\python.exe tests\\test_e2e.py
 """
@@ -34,8 +26,7 @@ sys.path.insert(0, str(BACKEND_DIR))
 TMP_ROOT = PROJECT_ROOT / ".tmp" / "tests"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
-# 关键：本套件会 clear_all()，必须让它跑在临时数据目录上。
-# 否则一次测试就会把用户上传的文档和索引全部删掉。
+# 本套件会 clear_all()，必须跑在临时数据目录上，否则会把用户文档和索引全删掉。
 # 必须在导入 app.* 之前设置 —— 路径在 app.core.paths 导入时就固定了。
 os.environ["RAG_DATA_DIR"] = str(TMP_ROOT / "data_e2e")
 
@@ -83,14 +74,7 @@ def _recorder(sink: list[str]) -> Callable[[str], bool]:
 
 
 def _check_cold_start() -> None:
-    """``import app.main`` 不能拉起重量级依赖。
-
-    实测：``langchain_text_splitters`` 的包 ``__init__`` 会连带导入整个
-    ``sentence_transformers``（含 torch 与全部 loss/trainer），单这一条就是
-    9.5 秒。它挂在 ``app.main -> routers.documents -> services.loader`` 上，
-    于是端口要 10 秒后才开始监听 —— 用户先看到的是浏览器
-    「127.0.0.1 拒绝连接」。本用例把「导入链必须轻」钉死。
-    """
+    """``import app.main`` 不能拉起重量级依赖（否则端口 10 秒后才监听）。"""
     report = TMP_ROOT / "cold_start_probe.json"
     if report.exists():
         report.unlink()
@@ -108,7 +92,7 @@ def _check_cold_start() -> None:
     )
 
     try:
-        # 不用管道捕获输出：受限环境下管道可能不可用，子进程直接写文件更稳
+        # 不用管道捕获输出，子进程直接写文件更稳
         subprocess.run(
             [sys.executable, "-c", code],
             cwd=str(BACKEND_DIR),
@@ -209,13 +193,7 @@ async def _check_browser_open() -> None:
 
 
 def _check_ollama_payload() -> None:
-    """便携版 Ollama 的完整性判定。
-
-    真实故障：解压中断后只留下一个 ollama.exe，此时
-    ``ollama serve`` 能启动、``/api/tags`` 能列出模型，一切看起来都正常，
-    但一发提问就 500（llama-server binary not found）。
-    所以判定必须落在「推理引擎文件在不在」上。
-    """
+    """便携版 Ollama 的完整性判定：只看推理引擎文件在不在。"""
     from app.services.setup import portable_ollama_status
 
     root = TMP_ROOT / "portable_probe"
@@ -249,7 +227,7 @@ def _check_ollama_payload() -> None:
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
-    # 本机实际状态：只报告、不断言 —— 环境问题不该让代码测试变红
+    # 本机实际状态：只报告、不断言
     live = portable_ollama_status()
     if live["present"] and live["complete"] is False:
         print(
@@ -334,8 +312,7 @@ CORPUS = [
 
 
 def prepare_corpus() -> list:
-    # 语料直接落在 UPLOADS_DIR 里：既贴近真实上传路径，也让「重建索引」
-    # （按原文件重跑解析）有文件可用。本套件的 UPLOADS_DIR 是隔离的临时目录。
+    # 语料直接落在 UPLOADS_DIR 里：贴近真实上传路径，也让「重建索引」有文件可用
     work = UPLOADS_DIR
     work.mkdir(parents=True, exist_ok=True)
 
@@ -360,7 +337,6 @@ async def main() -> int:
         return 1
     print(f"数据目录（隔离）: {DATA_DIR}")
 
-    # 保证从干净状态开始
     clear_all()
 
     try:
@@ -505,13 +481,8 @@ async def main() -> int:
 
         # ------------------------------------------------------------------
         section("6. 概览检索、阈值兜底与近重复去重")
-        # 用户实机反馈：「0.2 的相似度阈值下无法对文档的大致内容进行总结」。
-        # 根因：总结类提问问的是**整篇**，与任何单个片段都不相似
-        # （实测中文短问句「总结一下」最佳相似度 0.273，与随机噪声 0.25
-        # 几乎不可分），靠阈值筛必然漏。本节把新策略钉死：
-        #   * 概览类问题 → 忽略阈值，按全篇均匀取样，并换用概览提示词
-        #   * 阈值内无命中 → 自动放宽并标记 relaxed（界面据此给出提示）
-        #   * 近重复片段只留分数最高的一条，避免页眉副本占满召回槽位
+        # 防「总结类提问被阈值筛光」：概览模式改成按全篇均匀取样（换概览提示词），
+        # 阈值内无命中则自动放宽并标记 relaxed，近重复片段只留分数最高的一条。
         from app.services.rag import detect_intent
 
         check("「用三句话总结这些文档的主要内容」→ 概览意图",
@@ -566,16 +537,14 @@ async def main() -> int:
               isinstance(meta_overview.get("chunks_total"), int)
               and meta_overview["chunks_total"] > 0)
 
-        # 阈值兜底：阈值内一条都没有时，宁可给「低置信度答案 + 标记」，
-        # 也不要直接回「无法回答」（这正是用户抱怨的场景）
+        # 阈值兜底：阈值内一条都没有时给「低置信度答案 + 标记」，不回「无法回答」
         probe_question = "量子色动力学的渐近自由如何证明"
         _all_hits, baseline_info = vector_store.search_detailed(
             probe_question, top_k=3, score_threshold=0.0
         )
         best_score = float(baseline_info.get("best_score") or 0.0)
         # 本语料只有两篇、主题集中，任何中文提问的最佳相似度都在 0.4 上下，
-        # 已经高于默认的放宽上限（0.35）。为了验证「放宽」这条机制本身，
-        # 这里临时把上限抬到最佳分之上；上限语义另行断言（0.99 不放宽）。
+        # 高于默认放宽上限（0.35）；这里临时抬高上限以验证「放宽」机制本身。
         saved_limit = settings.score_relax_limit
         settings.score_relax_limit = min(0.99, round(best_score + 0.05, 4))
         try:
@@ -620,7 +589,6 @@ async def main() -> int:
 
         # 近重复去重：同一段文本被重复切进多个 chunk 时只保留分数最高的一条
         from langchain_core.documents import Document
-
         duplicated = [
             (Document(page_content="页眉样板文本 " + "住宿费一线城市每晚 600 元。" * 8), 0.61),
             (Document(page_content="页眉样板文本 " + "住宿费一线城市每晚 600 元。" * 8), 0.60),
@@ -711,10 +679,8 @@ async def main() -> int:
 
         # ------------------------------------------------------------------
         section("12. 原生 thinking 通道（reasoning_content）")
-        # Ollama 的原生 thinking 通道下，思维链不在 content 里，而是由
-        # langchain-ollama 放进 additional_kwargs["reasoning_content"]。
-        # 只认 additional_kwargs["thinking"] 的话，这些内容会被静默丢弃：
-        # 界面上就是「点了发送很久没反应」。
+        # 防「点了发送很久没反应」：原生 thinking 通道下思维链不在 content 里，
+        # 而在 additional_kwargs["reasoning_content"]，只认 thinking 就会静默丢弃。
         native = FakeLLM([
             FakeChunk("", thinking_native="我先看看文档里的住宿条款。", meta={"eval_count": 12}),
             FakeChunk("根据文档，住宿费一线城市每晚 600 元 [1]。",
@@ -736,6 +702,67 @@ async def main() -> int:
         check("sources 事件带回原生推理链",
               "住宿条款" in (sources_event["data"]["thinking"] or ""),
               str(sources_event["data"]["thinking"])[:40])
+
+        # ------------------------------------------------------------------
+        section("13. 概览取样只给用到的片段打分（不再全库扫两遍）")
+        # 防「大库上概览取样白白扫全库」：旧实现做一次 O(n·d) 全量扫描，
+        # 现在对目标片段做 reconstruct（O(k·d)）。这里包一层计数器断言。
+        class _GuardedIndex:
+            def __init__(self, index):
+                self._index = index
+                self.searches = 0
+                self.reconstructs = 0
+
+            def search(self, *args, **kwargs):
+                self.searches += 1
+                return self._index.search(*args, **kwargs)
+
+            def reconstruct(self, *args, **kwargs):
+                self.reconstructs += 1
+                return self._index.reconstruct(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._index, name)
+
+        store = vector_store.ensure_loaded()
+        original_index = store.index
+        guarded = _GuardedIndex(original_index)
+        store.index = guarded
+        try:
+            ov_sources, ov_info = vector_store.overview_chunks("总结这些文档的主要内容", limit=4)
+        finally:
+            store.index = original_index
+
+        check("概览取样没有触发全库扫描", guarded.searches == 0,
+              f"index.search 被调用 {guarded.searches} 次")
+        check("只为取到的片段按需算分",
+              guarded.reconstructs == len(ov_sources) and len(ov_sources) > 0,
+              f"reconstruct {guarded.reconstructs} 次 / 取样 {len(ov_sources)} 段")
+        check("按需算出的分数是真实相似度（不是 0）",
+              all(item.score > 0 for item in ov_sources),
+              str([round(item.score, 3) for item in ov_sources]))
+
+        # 与「全库扫描」的旧算法逐条比对，确保优化没有改变分数
+        import numpy as np
+
+        from app.services.embeddings import get_embeddings
+
+        probe = "总结这些文档的主要内容"
+        probe_vector = get_embeddings().embed_query(probe)
+        scan_scores, scan_indices = original_index.search(
+            np.asarray(probe_vector, dtype="float32").reshape(1, -1), vector_store.size
+        )
+        expected = {
+            store.index_to_docstore_id[int(index)]: float(score)
+            for score, index in zip(scan_scores[0], scan_indices[0])
+            if int(index) >= 0
+        }
+        entries = vector_store._ordered_entries(None)
+        actual = vector_store._score_map(probe_vector, entries)
+        deltas = [abs(actual[entry.docstore_id] - expected[entry.docstore_id]) for entry in entries]
+        check("按需取分与全库扫描结果逐条一致（数值等价）",
+              bool(entries) and len(actual) == len(entries) and max(deltas) < 1e-4,
+              f"{len(actual)}/{len(entries)} 条，最大偏差 {max(deltas, default=0):.2e}")
 
     finally:
         # ------------------------------------------------------------------

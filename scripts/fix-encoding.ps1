@@ -1,17 +1,8 @@
 ﻿# ============================================================================
 #  fix-encoding.ps1 —— 修复脚本文件编码
-#
-#  为什么需要它：
-#    * .ps1 用编辑器/工具重写后容易丢掉 UTF-8 BOM。Windows PowerShell 5.1
-#      遇到没有 BOM 的文件会按系统 ANSI 代码页（中文机器上是 GBK）解析，
-#      中文的字节错位会吃掉字符串的引号，最后报一句
-#      "Unexpected token" —— 完全看不出真正原因。
-#    * .cmd 则相反，必须保持纯 ASCII：cmd.exe 按 OEM 代码页读取，
-#      含中文时注释行会被撕成碎片，碎片反过来被当成命令执行。
-#
-#  本脚本会把 .ps1 补上 BOM、并检查 .cmd 是否仍为纯 ASCII。
-#  用法：
-#    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fix-encoding.ps1
+#  用法：powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fix-encoding.ps1 [-CheckOnly]
+#  .ps1/.cs 必须带 UTF-8 BOM（否则 PS 5.1 / csc.exe 按 ANSI(936) 读，中文乱码报错）；
+#  .cmd 必须纯 ASCII（否则 cmd.exe 按 OEM 代码页读，中文注释被撕成碎片当命令执行）。
 # ============================================================================
 
 [CmdletBinding()]
@@ -33,8 +24,7 @@ $ps1Files = @(
     'tests\test_launcher.ps1',
     'tests\hang-probe.ps1'
 )
-# .cs 同样需要 BOM：csc.exe 靠 BOM 判断源文件编码，
-# 没有 BOM 时会按系统 ANSI(936) 解析，中文界面文字全变乱码。
+# .cs 与 .ps1 同理：csc.exe 靠 BOM 判断源文件编码
 $csFiles = @(
     'launcher\RagQaLauncher.cs'
 )

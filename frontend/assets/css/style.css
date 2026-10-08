@@ -1,6 +1,5 @@
 /* ==========================================================================
-   离线 RAG 文档问答 — 样式表
-   无任何外部依赖（无 web font / 无 CDN），保证离线可用。
+   离线 RAG 文档问答 — 样式表（无外部依赖，保证离线可用）
    ========================================================================== */
 
 :root {
@@ -56,12 +55,10 @@
 /* --------------------------------------------------------------------------
    hidden 属性必须永远生效
    --------------------------------------------------------------------------
-   浏览器默认样式里是 [hidden] { display: none }，特异性只有 0-1-0。
-   只要任何一条类选择器规则里写了 display（.modal 是 grid、.sources 是 flex、
-   .setup-banner 是 flex……），两者特异性相同、后写的赢 —— 于是
-   `el.xxx.hidden = true` 设了也白设，元素依然显示。
-   表现就是「按钮点了没反应」：其实是弹窗根本没被关掉。
-   用 !important 把这条兜底规则钉死，比逐个给 [hidden] 加变体可靠得多。
+   浏览器默认的 [hidden] { display: none } 特异性只有 0-1-0，任何类选择器里
+   写了 display（.modal 是 grid、.sources 是 flex……）都会把它盖掉，于是
+   `el.xxx.hidden = true` 设了也白设，表现成「按钮点了没反应」。用 !important
+   兜底比逐个给 [hidden] 加变体可靠。
    -------------------------------------------------------------------------- */
 [hidden] { display: none !important; }
 
@@ -239,6 +236,13 @@ button, input, textarea { font: inherit; color: inherit; }
 }
 .doc-item__name:hover { color: var(--accent); }
 .doc-item__meta { font-size: 11px; color: var(--text-faint); }
+/* 解析警告（典型：扫描版 PDF 没抽到正文）—— 必须显眼，否则用户只会觉得文档白传了。 */
+.doc-item__warn {
+  display: inline-block; margin-top: 3px; padding: 1px 6px;
+  border-radius: 999px; font-size: 10.5px; cursor: help;
+  background: rgba(217,119,6,.14); color: var(--warn);
+}
+.doc-item.is-warned .doc-item__icon { background: rgba(217,119,6,.16); color: var(--warn); }
 .doc-item__del {
   flex: 0 0 auto; border: 0; background: transparent; cursor: pointer;
   color: var(--text-faint); font-size: 16px; line-height: 1; padding: 2px 4px;
@@ -825,7 +829,7 @@ input[type="range"]::-moz-range-thumb {
 .install-actions__row { display: flex; flex-wrap: wrap; gap: 8px; }
 .install-actions--ok { border-color: var(--ok); background: rgba(22, 163, 74, .08); }
 
-/* 进度行：\r 刷新原地重写，用等宽+淡化把它和普通日志区分开 */
+/* 进度行：\r 刷新原地重写，用颜色把它和普通日志区分开 */
 .install-log .log-progress { color: #93c5fd; opacity: .85; }
 
 /* ============================ 响应式 ============================ */

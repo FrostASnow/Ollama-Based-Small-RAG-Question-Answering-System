@@ -1,8 +1,7 @@
 """Server-Sent Events 工具。
 
-采用「生产者任务 + 队列 + 超时心跳」的模式，而不是对异步生成器直接
-``wait_for``：对 ``__anext__`` 施加超时会取消正在 await 的协程，
-进而把整个异步生成器关掉（Python 的已知行为），导致流式回答被截断。
+采用「生产者任务 + 队列 + 超时心跳」模式，而不是对异步生成器直接 ``wait_for``：
+对 ``__anext__`` 施加超时会取消协程并关掉整个异步生成器，导致流式回答被截断。
 """
 
 from __future__ import annotations
@@ -32,8 +31,7 @@ async def stream_with_heartbeat(
 ) -> AsyncIterator[str]:
     """把 ``{event, data}`` 事件流转成 SSE 文本流，并周期性发送心跳。
 
-    ``factory`` 必须是「返回异步生成器」的可调用对象——每次调用都新建一个
-    生成器，避免复用已被消费的生成器。
+    ``factory`` 必须每次调用都新建生成器，避免复用已被消费的生成器。
     """
     queue: asyncio.Queue[Any] = asyncio.Queue()
 

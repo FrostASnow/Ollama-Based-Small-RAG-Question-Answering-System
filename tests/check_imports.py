@@ -1,7 +1,5 @@
 """导入体检：确认所有关键依赖都能按预期路径导入。
 
-用途：环境准备完成后、正式启动服务前跑一次，快速定位版本不兼容问题。
-
     .venv\\Scripts\\python.exe tests\\check_imports.py
 """
 
@@ -43,16 +41,40 @@ def _mod(name: str, attr: str | None = None):  # noqa: ANN202
 
 
 def _splitter_via_loader() -> str:
-    """走 loader 的延迟导入路径构造切分器。
-
-    `langchain_text_splitters` 被刻意从模块顶层挪进了函数里（顶层导入会连带
-    整个 sentence_transformers，冷启动多 9.5 秒），这里确认这条延迟路径能用。
-    """
+    """走 loader 的延迟导入路径构造切分器（顶层导入 sentence_transformers 要 9.5 秒）。"""
     from app.services.loader import build_splitter
 
     splitter = build_splitter()
     chunks = splitter.split_text("第一段内容。" * 200)
     return f"{type(splitter).__name__} -> {len(chunks)} chunks"
+
+
+def _audit_all_exports() -> str:
+    """遍历 app 包，检查每个模块 `__all__` 里列出的名字是否真的存在。"""
+    import importlib
+    import pkgutil
+
+    import app
+
+    problems: list[str] = []
+    checked = 0
+
+    for module_info in pkgutil.walk_packages(app.__path__, prefix="app."):
+        name = module_info.name
+        try:
+            module = importlib.import_module(name)
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"{name} 导入失败（{type(exc).__name__}: {exc}）")
+            continue
+
+        for exported in getattr(module, "__all__", []) or []:
+            checked += 1
+            if not hasattr(module, exported):
+                problems.append(f"{name}.__all__ 里的 '{exported}' 并不存在")
+
+    if problems:
+        raise AssertionError("；".join(problems))
+    return f"扫描全部子模块，{checked} 个导出名都存在"
 
 
 def main() -> int:
@@ -92,6 +114,7 @@ def main() -> int:
     check("pypdf", _mod("pypdf"))
     check("docx2txt", _mod("docx2txt"))
     check("app.services.loader: build_splitter（延迟导入）", _splitter_via_loader)
+    check("全仓库 __all__ 导出名都存在", _audit_all_exports)
 
     print()
     for label, ok, detail in results:

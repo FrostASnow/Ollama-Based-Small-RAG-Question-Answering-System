@@ -1,10 +1,8 @@
 ﻿# ============================================================================
 #  stop.ps1 —— 停止本项目相关的进程（后端 + Ollama）
-#
 #  用法：
-#    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\stop.ps1
-#
-#  注意：如果 Ollama 是你自己安装并常驻使用的，加 -KeepOllama 只停后端。
+#    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\stop.ps1 [-KeepOllama]
+#  Ollama 是你自己常驻使用的就加 -KeepOllama，只停后端。
 # ============================================================================
 
 [CmdletBinding()]
@@ -29,8 +27,7 @@ function Write-Warn2($text) { Write-Host "[WARN] $text" -ForegroundColor Yellow 
 
 Write-Host '=== 停止后端 ===' -ForegroundColor Cyan
 
-# 公共运行时助手（netstat 解析、按端口找进程等）。这里提前载入：
-# 下面「按端口兜底」和「停 Ollama」都要用它。
+# lib 提供 netstat 解析 / 按端口找进程等助手，下面「按端口兜底」和「停 Ollama」都要用
 $lib = Join-Path $PSScriptRoot 'lib\ollama-runtime.ps1'
 if (-not (Test-Path $lib)) {
     Write-Err "缺少 $lib，无法安全停止"
@@ -50,11 +47,8 @@ foreach ($p in $procs) {
     }
 }
 
-# 回退：按端口占用查找。
-# 注意不要用 Get-NetTCPConnection：它在受限账户/受限环境里会直接抛「拒绝访问」，
-# 于是整条回退路径形同虚设（实测：-launcher 的 --stop 就是卡在这里，
-# 端口明明还在监听，脚本却报「没有发现运行中的后端」）。
-# Get-PortListenerProcessId 走 netstat -ano 解析，不需要额外权限。
+# 回退：按端口占用查找。不要用 Get-NetTCPConnection —— 它在受限账户下直接抛「拒绝访问」，
+# 整条回退路径形同虚设；Get-PortListenerProcessId 走 netstat -ano，不需要额外权限。
 if ($killed -eq 0) {
     $owner = Get-PortListenerProcessId -Port $Port
     if ($owner -gt 0) {
@@ -82,10 +76,7 @@ if ($KeepOllama) {
 } else {
     Write-Host '=== 停止 Ollama ===' -ForegroundColor Cyan
 
-    # 与 start.ps1 退出时走同一套逻辑（scripts\lib\ollama-runtime.ps1，已在上面载入）：
-    #   1. 项目内置的那份（路径在 tools\ollama 下）
-    #   2. 端口 11434 上仍在监听的（可能是之前留下或系统安装的）
-    # 这样「后端停了、Ollama 还在后台吃显存」的情况不会出现。
+    # 与 start.ps1 退出时同一套逻辑：停项目内置的那份 + 端口 11434 上仍在监听的
     $stopped = @(Stop-PortableOllamaForProject -Dir (Join-Path $ProjectRoot 'tools\ollama') -Port 11434)
     if ($stopped.Count -gt 0) {
         Write-Host "[OK]   已停止 Ollama（PID $($stopped -join ', ')）" -ForegroundColor Green

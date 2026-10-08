@@ -1,16 +1,8 @@
 ﻿# ============================================================================
 #  build-launcher.ps1 —— 编译一体化启动器 RAG-QA.exe
-#
-#  为什么用 csc.exe（.NET Framework 4.x）而不是 .NET 9 / PyInstaller：
-#    * Windows 10 1903+ / 11 自带 .NET Framework 4.8，**目标机器零安装**；
-#    * 本机 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe 直接可用，
-#      不需要 .NET SDK、不需要 NuGet、不需要联网（本项目要求离线可用）；
-#    * 编译出来的 exe 只有几十 KB，启动瞬时。
-#  代价：编译器只支持 C# 5 语法，源码里刻意不用字符串插值、?. 等新语法。
-#
-#  用法：
-#    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-launcher.ps1
-#    powershell ... -File scripts\build-launcher.ps1 -CheckOnly    # 只检查是否已是最新
+#  用法：powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-launcher.ps1 [-CheckOnly]
+#  用 .NET Framework 4.x 自带的 csc.exe（Win10 1903+ 自带，零安装、可离线），
+#  代价是只支持 C# 5 语法，源码里刻意不用字符串插值、?. 等新语法。
 # ============================================================================
 
 [CmdletBinding()]
@@ -45,12 +37,8 @@ function Find-Csc {
     return $null
 }
 
-# ---------------------------------------------------------------------------
-# 源文件必须是 UTF-8 带 BOM
-# ---------------------------------------------------------------------------
-# csc.exe 靠 BOM 判断源文件编码；没有 BOM 时按系统 ANSI(936) 解析，
-# 源码里的中文字符串会整片变成乱码 —— 界面上的中文全成问号。
-# ---------------------------------------------------------------------------
+# 源文件必须是 UTF-8 带 BOM：csc.exe 靠 BOM 判断编码，无 BOM 时按 ANSI(936) 解析，
+# 源码里的中文字符串会整片变成乱码。
 if (-not (Test-Path $Source)) {
     Write-Bad "找不到源文件：$Source"
     exit 1
@@ -68,9 +56,7 @@ if (-not $hasBom) {
     [System.IO.File]::WriteAllText($Source, $text, [System.Text.UTF8Encoding]::new($true))
 }
 
-# ---------------------------------------------------------------------------
 # 新鲜度检查：exe 必须比源码新
-# ---------------------------------------------------------------------------
 $sourceTime = (Get-Item $Source).LastWriteTime
 $exeExists = Test-Path $Output
 if ($CheckOnly) {
@@ -92,8 +78,7 @@ if (-not $csc) {
 }
 
 Write-Host '=== 生成图标 ===' -ForegroundColor Cyan
-# 图标在构建时生成，仓库里就不用放二进制资源。
-# ICO 容器里直接放 PNG 数据（Vista 以后支持），因此不需要自己写 BMP 位图。
+# 图标构建时生成，仓库里不放二进制资源；ICO 里直接放 PNG 数据（Vista 以后支持）。
 function New-IconPng([int]$size) {
     $bmp = New-Object System.Drawing.Bitmap($size, $size)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -126,9 +111,8 @@ function New-IconPng([int]$size) {
 
     $stream = New-Object System.IO.MemoryStream
     $bmp.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
-    # 返回 MemoryStream 而不是 byte[]：PowerShell 会把函数返回的**数组展开**成
-    # 多个对象，调用方拿到的是 object[] 而非 byte[]，写进 ICO 就是空数据
-    # （第一次构建产出的 ico 只有 74 字节，就是这个坑）。
+    # 返回 MemoryStream 而不是 byte[]：PowerShell 会把函数返回的数组展开成多个对象，
+    # 调用方拿到 object[] 而非 byte[]，写进 ICO 就是空数据。
     $font.Dispose(); $brush.Dispose(); $white.Dispose(); $format.Dispose(); $g.Dispose(); $bmp.Dispose()
     return $stream
 }

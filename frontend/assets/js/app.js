@@ -1,11 +1,4 @@
-/**
- * 前端主逻辑（免构建原生 ES Module）。
- *
- * 职责：
- *   - 文档上传 / 列表 / 删除 / 按文档过滤检索
- *   - 流式问答渲染（Markdown、推理链折叠、引用溯源）
- *   - 系统状态与参数设置
- */
+/** 前端主逻辑（免构建原生 ES Module）：文档管理、流式问答渲染、系统状态与设置。 */
 
 import {
   ApiError,
@@ -197,6 +190,19 @@ async function refreshHealth() {
   }
 }
 
+/** 索引一致性摘要：换过嵌入模型或 chunk_size 后索引会与配置分叉，而界面上看不出来。 */
+function indexStatusParts(health) {
+  const report = health?.detail?.index;
+  if (!report || report.state === 'empty') return null;
+  if (report.compatible && !report.stale) return { ok: true, text: '与当前配置一致' };
+  const detail = (report.reasons?.length ? report.reasons : report.notices) || [];
+  return {
+    ok: false,
+    text: report.compatible ? '与当前配置不一致（建议重建）' : '与当前嵌入模型不一致（必须重建）',
+    detail,
+  };
+}
+
 function renderHealthDrawer() {
   const health = state.health;
   if (!health) {
@@ -207,6 +213,7 @@ function renderHealthDrawer() {
   const chip = (ok, yes = '正常', no = '异常') =>
     `<span class="${ok ? 'chip-ok' : 'chip-err'}">${ok ? yes : no}</span>`;
 
+  const indexStatus = indexStatusParts(health);
   const rows = [
     ['服务状态', chip(health.status === 'ok', '就绪', '降级')],
     ['离线模式', chip(health.offline, '已启用', '未启用')],
@@ -218,6 +225,9 @@ function renderHealthDrawer() {
     ['嵌入模型', `${escapeHtml(health.embedding_model)} ${chip(health.embedding_ready)}`],
     ['嵌入设备', escapeHtml(health.embedding_device)],
     ['向量索引', `${chip(health.index_ready)} · ${health.detail?.vector_store?.vectors ?? 0} 个向量`],
+    ['索引一致性', indexStatus
+      ? chip(indexStatus.ok, indexStatus.text, indexStatus.text)
+      : '<em>尚无索引</em>'],
     ['文档 / 分块', `${health.document_count} / ${health.chunk_count}`],
     ['版本', escapeHtml(health.version)],
   ];
@@ -228,11 +238,21 @@ function renderHealthDrawer() {
       problems.map((p) => `<li>${escapeHtml(p)}</li>`).join('')}</ul></div>`
     : '';
 
+  const indexHint = indexStatus && !indexStatus.ok
+    ? `<div class="hint-box">
+         <strong>索引需要重建：</strong>
+         <ul>${(indexStatus.detail || []).map((t) => `<li>${escapeHtml(t)}</li>`).join('')}</ul>
+         左侧「知识库」面板里的 <strong>重建索引</strong> 按钮会用 data\\uploads 里的原始文件
+         按当前配置重新分块并重新生成向量（不会丢文档）。
+       </div>`
+    : '';
+
   el.healthBody.innerHTML = `
     ${problemBox}
     <dl class="kv">
       ${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}
     </dl>
+    ${indexHint}
     ${problems.length ? `<div class="hint-box">
       若 Ollama 未启动，可运行项目根目录下的 <code>scripts\\start.ps1</code>（会自动拉起 Ollama 与后端）。
     </div>` : ''}
@@ -283,6 +303,17 @@ function renderDocuments() {
 
     body.append(name, meta);
 
+    // 解析警告必须显式标出：只留在日志里用户看不到，只会觉得文档白传了。
+    const warnings = doc.warnings || [];
+    if (warnings.length) {
+      li.classList.add('is-warned');
+      const warn = document.createElement('span');
+      warn.className = 'doc-item__warn';
+      warn.textContent = '⚠ 解析警告';
+      warn.title = warnings.join('\n');
+      body.appendChild(warn);
+    }
+
     const del = document.createElement('button');
     del.className = 'doc-item__del';
     del.textContent = '×';
@@ -298,7 +329,6 @@ async function loadDocuments() {
   try {
     const data = await listDocuments();
     state.documents = data.documents || [];
-    // 清理已被删除文档的选中态
     const alive = new Set(state.documents.map((d) => d.doc_id));
     for (const id of [...state.selectedDocIds]) if (!alive.has(id)) state.selectedDocIds.delete(id);
     renderDocuments();
@@ -372,6 +402,11 @@ async function handleFiles(fileList) {
 
     if (succeeded) toast(`已处理 ${succeeded} 个文件`, 'ok');
     for (const item of failed) toast(item.message, 'err', 6000);
+    // 成功的文件也可能带警告，不能只停留在「已处理 N 个文件」。
+    for (const item of results) {
+      if (!item.document.warnings?.length) continue;
+      toast(item.message, 'warn', 12000);
+    }
 
     await Promise.all([loadDocuments(), refreshHealth()]);
   } catch (error) {
@@ -505,13 +540,7 @@ function createAssistantMessage() {
   };
 }
 
-/**
- * 组装回答上方的元信息：模型 / 召回的片段数 / 检索策略徽标。
- *
- * 「全文概览」和「已放宽阈值」都必须显式告诉用户，否则他会以为
- * 这是普通问答的结果 —— 前者换了检索策略（不看相似度，按全篇取样），
- * 后者是阈值内没命中、程序自动放宽了标准。
- */
+/** 「全文概览」换了检索策略、「已放宽阈值」是自动放宽了标准，都必须显式告知用户。 */
 function renderMetaLine(data) {
   const parts = [`<span>模型 ${escapeHtml(data.model || '-')}</span>`];
 
@@ -873,9 +902,8 @@ function renderEnvPanel(environment) {
 
   const toolchain = environment.toolchain || {};
 
-  // 便携版 Ollama 只装了一半时：ollama.exe 在、服务也能起、模型也能列，
-  // 但一提问就报 llama-server binary not found。只按「文件在不在」显示
-  // 「已就绪」，会和下面的问题卡片自相矛盾，所以这里单独区分出第三种状态。
+  // 便携版 Ollama 只装了一半：文件在、服务能起，但提问报 llama-server not found。
+  // 只按「文件在不在」显示「已就绪」会和下面的问题卡片自相矛盾，故区分第三种状态。
   const portable = environment.ollama_portable || {};
   const ollamaIncomplete = portable.present === true && portable.complete === false;
 
@@ -954,8 +982,7 @@ function classifyLogLine(line) {
 function appendInstallLog(line, isProgress = false) {
   const last = el.installLog.lastElementChild;
 
-  // 进度行的语义是「回到行首重写」，所以覆盖上一行而不是不断追加。
-  // 不这么做的话，一次 1.4GB 下载能刷出上千行进度帧，把真正的错误冲出视野。
+  // 进度行语义是「回到行首重写」，必须覆盖上一行；否则上千行进度帧会把真正的错误冲出视野。
   if (isProgress && last && last.dataset.progress === '1') {
     last.textContent = `${line}\n`;
     last.className = `log-progress ${classifyLogLine(line)}`.trim();
@@ -1020,7 +1047,6 @@ function setInstallState(text, kind = '') {
   el.installState.className = `install-state${kind ? ` is-${kind}` : ''}`;
 }
 
-/** 订阅安装日志流，直到任务结束。 */
 async function watchInstall({ reset = false } = {}) {
   installStreamController?.abort();
   installStreamController = new AbortController();
@@ -1079,7 +1105,6 @@ async function watchInstall({ reset = false } = {}) {
   }
 }
 
-/** 发起安装并跟进进度。 */
 async function runInstall({ mirror = false } = {}) {
   el.setupAutoInstall.disabled = true;
   try {
@@ -1200,12 +1225,7 @@ function renderSetup(report) {
   });
 }
 
-/**
- * 拉取配置体检报告。
- * @param {object} options
- * @param {boolean} options.fresh 绕过后端探测缓存
- * @param {boolean} options.auto  启动时的自动检测：已就绪或用户已静音则不弹窗
- */
+/** 拉取配置体检报告；fresh 绕过后端缓存，auto 为启动时自动检测（已就绪或已静音则不弹窗）。 */
 async function loadSetup({ fresh = false, auto = false } = {}) {
   try {
     const report = await getSetup(fresh);
@@ -1213,8 +1233,8 @@ async function loadSetup({ fresh = false, auto = false } = {}) {
     updateSetupBanner(report);
     renderSetup(report);
 
-    // 若已有安装任务在进行（也包括用户刷新页面后重新接入），直接切到进度视图。
-    // installStreamController 非空说明前端已经在跟这个流了，不要重复订阅。
+    // 已有安装任务（含刷新页面后重新接入）就直接切到进度视图；
+    // installStreamController 非空说明前端已在跟这个流，不要重复订阅。
     const install = await getInstallStatus().catch(() => null);
     if (install?.running) {
       openSetupModal();
@@ -1341,8 +1361,7 @@ function bindGlobal() {
     }
   });
 
-  // 重建索引：解析/切分逻辑升级后（例如新增了 PDF 页眉过滤），
-  // 磁盘上的旧索引不会自动更新，需要按原文件重跑一遍。
+  // 解析/切分逻辑升级后磁盘上的旧索引不会自动更新，需按原文件重跑一遍。
   el.reindexBtn.addEventListener('click', async () => {
     if (!state.documents.length) { toast('知识库为空，无需重建', 'warn'); return; }
     if (!window.confirm(
@@ -1358,7 +1377,13 @@ function bindGlobal() {
       const changed = report.chunks_before !== report.chunks_after
         ? `分块 ${report.chunks_before} → ${report.chunks_after}`
         : `分块 ${report.chunks_after} 块（未变化）`;
-      toast(`已重建 ${report.rebuilt} 个文档，${changed}`, report.failed ? 'warn' : 'ok');
+      let note = `已重建 ${report.rebuilt} 个文档，${changed}`;
+      if (report.rebuilt_from_scratch) note += '（嵌入模型已变更，整体重建）';
+      toast(note, report.failed ? 'warn' : 'ok');
+      if (report.backup_dir) {
+        // 重建是「先删后建」，告诉用户旧索引被备份到哪，出事能捞回来
+        console.info('重建前的索引备份：', report.backup_dir); // eslint-disable-line no-console
+      }
       if (report.failed) {
         const failed = (report.details || []).filter((item) => item.status !== 'ok');
         for (const item of failed.slice(0, 3)) {

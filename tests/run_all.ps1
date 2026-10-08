@@ -1,13 +1,8 @@
 ﻿# ============================================================================
 #  run_all.ps1 —— 一键跑完所有测试
-#
 #  用法：
-#    pwsh -File tests\run_all.ps1
-#    pwsh -File tests\run_all.ps1 -SkipHttp        # 不跑需要在线服务的 HTTP 验收
-#
-#  说明：
-#    HTTP 验收需要后端已在运行（scripts\start.ps1）。
-#    若检测到服务未启动，会自动拉起一个临时实例并在结束后关闭。
+#    pwsh -File tests\run_all.ps1 [-SkipHttp]     # -SkipHttp 不跑需要在线服务的 HTTP 验收
+#  HTTP 验收需要后端已在运行；若未启动会自动拉起临时实例并在结束后关闭。
 # ============================================================================
 
 [CmdletBinding()]
@@ -39,10 +34,8 @@ function Invoke-Suite {
     Write-Host ('=' * 74) -ForegroundColor DarkGray
 
     $path = Join-Path $PSScriptRoot $File
-    # 这里刻意**不再** 把输出丢给 Out-Null：
-    # 以前调用方写 `Invoke-Suite ... | Out-Null`，连子进程的 stdout 一并被吞掉，
-    # 套件失败时只剩汇总表里一个「失败」，排查时毫无线索。
-    # 参数名也不能叫 $Args —— 那是 PowerShell 的自动变量。
+    # 刻意不把输出丢给 Out-Null：否则连子进程 stdout 一并被吞，套件失败时毫无线索。
+    # 参数名不能叫 $Args —— 那是 PowerShell 的自动变量。
     & $VenvPython $path @SuiteArgs
     $code = $LASTEXITCODE
 
@@ -64,16 +57,9 @@ Write-Host @"
 ============================================================================
 "@ -ForegroundColor White
 
-# ---------------------------------------------------------------------------
-# 预检：脚本编码与语法
-# ---------------------------------------------------------------------------
-# 这两条规则一旦被破坏，故障表现都极其隐晦，而且都在「启动阶段」：
-#   * .ps1 丢掉 UTF-8 BOM → PowerShell 5.1 按 GBK 解析中文，
-#     字节错位会吃掉字符串的引号，报 "Unexpected token" 让人完全摸不着头脑
-#   * .cmd 含非 ASCII   → cmd.exe 按 OEM 代码页读，注释行被撕成碎片，
-#     碎片反过来被当成命令执行，脚本一行都跑不到
-# 放进测试套件，避免以后编辑文件时再次踩坑。
-# ---------------------------------------------------------------------------
+# 预检：脚本编码与语法。两条规则一旦破坏，故障都在「启动阶段」且极隐晦：
+# .ps1 丢 BOM → PS 5.1 按 GBK 解析，字节错位吃掉引号，报 "Unexpected token"；
+# .cmd 含非 ASCII → cmd.exe 按 OEM 代码页读，注释碎片被当成命令执行。
 Write-Host ''
 Write-Host ('=' * 74) -ForegroundColor DarkGray
 Write-Host '  预检：脚本编码与语法' -ForegroundColor Cyan
@@ -94,8 +80,8 @@ foreach ($rel in @('scripts\prepare.ps1', 'scripts\start.ps1', 'scripts\stop.ps1
     }
 
     $parseErrors = $null
-    # 只对 .ps1 做 PowerShell 语法检查：.cs 只是借用同一套 BOM 规则
-    # （csc.exe 也靠 BOM 识别源文件编码），拿 PowerShell 解析器去读它必然误报。
+    # 只对 .ps1 做语法检查：.cs 只是借用同一套 BOM 规则（csc 也靠 BOM 识别编码），
+    # 拿 PowerShell 解析器读它必然误报。
     if ($rel -like '*.ps1') {
         [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$parseErrors) | Out-Null
         if ($parseErrors.Count -eq 0) {
@@ -118,17 +104,9 @@ foreach ($rel in @('scripts\start.cmd', 'scripts\prepare.cmd', 'scripts\build-la
     }
 }
 
-# ---------------------------------------------------------------------------
-# 预检：便携版 Ollama 的完整性 / 清理逻辑（真实跑一遍，不只是看字符串）
-# ---------------------------------------------------------------------------
-# 两个真实踩过的坑，都必须在这里挡住：
-#   1. 解压中断留下「只有 ollama.exe」的假安装：ollama serve 能启动、
-#      /api/tags 也能列出模型，唯独一提问就报 llama-server binary not found。
-#   2. Windows 不允许删除正在运行的程序。如果用户先启动服务再点「一键安装」，
-#      Remove-Item 会静默失败，脚本随后看到 ollama.exe 还在，就当成「已装好」，
-#      一路 [OK] 并以退出码 0 结束 —— 用户看到「安装成功」，坏文件一个没换。
-# 所以这里真的起一个占用文件的进程来验证「停止 → 删除 → 确认」这条链路。
-# ---------------------------------------------------------------------------
+# 预检：便携版 Ollama 的完整性 / 清理逻辑（真实跑一遍，不只是看字符串）。
+# 要挡住两个坑：解压中断留下「只有 ollama.exe」的假安装（能 serve、能列模型，
+# 提问才报 llama-server not found）；以及删除被运行中进程占用的目录会静默失败。
 $libPath = Join-Path $ProjectRoot 'scripts\lib\ollama-runtime.ps1'
 if (-not (Test-Path $libPath)) {
     Write-Host "  [FAIL] 缺少 $libPath" -ForegroundColor Red
@@ -176,9 +154,8 @@ if (-not (Test-Path $libPath)) {
             $scriptOk = $false
         }
 
-        # (d) 文件被运行中的进程占用时必须能自动停掉并删除干净
-        #     （用 ping.exe 的副本冒充 ollama.exe：进程名随文件名变成 ollama，
-        #       路径又落在被清理的目录内，正好复现真实场景）
+        # (d) 文件被运行中的进程占用时必须能自动停掉并删除干净（用 ping.exe 的副本
+        #     冒充 ollama.exe：进程名随文件名变成 ollama，路径落在被清理的目录内）。
         Remove-Item -Force $probeExe -ErrorAction SilentlyContinue
         Copy-Item -Path (Join-Path $env:SystemRoot 'System32\ping.exe') -Destination $probeExe -Force
         try {
@@ -203,7 +180,6 @@ if (-not (Test-Path $libPath)) {
         }
 
         # (e) 退出清理：按 PID 结束进程树（start.ps1 / stop.ps1 退出时走的就是它）。
-        #     这条保证「程序关了，Ollama 还挂在后台吃显存」不会再发生。
         Remove-Item -Recurse -Force $probeRoot -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Force -Path $probeRoot | Out-Null
         Copy-Item -Path (Join-Path $env:SystemRoot 'System32\ping.exe') -Destination $probeExe -Force
@@ -282,9 +258,7 @@ if (-not (Test-Path $libPath)) {
         $scriptOk = $false
     }
 
-    # --github-asset 的 latest 标签：必须走 /releases/latest。
-    # /releases/tags/latest 会 404（并不存在名叫 latest 的标签），
-    # 而这正是「默认下载源一开始就失败、被迫退回慢镜像」的原因。
+    # --github-asset 的 latest 标签必须走 /releases/latest：/releases/tags/latest 会 404。
     $fetchText = Get-Content (Join-Path $ProjectRoot 'scripts\fetch.mjs') -Raw -Encoding UTF8
     if ($fetchText -match 'releases/latest' -and $fetchText -match "tag === 'latest'") {
         Write-Host '  [PASS] fetch.mjs 正确处理 latest 标签' -ForegroundColor Green
@@ -293,9 +267,8 @@ if (-not (Test-Path $libPath)) {
         $scriptOk = $false
     }
 
-    # 进度必须是「\n 结尾的整行」：PowerShell 5.1 按行转发原生命令输出，
-    # 只有 \r 的进度会被攒到进程退出才落盘 —— 1.4GB 下载在日志里全程一片空白，
-    # 用户根本分不清是在下载还是卡死。
+    # 进度必须是 \n 结尾的整行：PS 5.1 按行转发原生命令输出，只有 \r 的进度会被
+    # 攒到进程退出才落盘，下载在日志里全程一片空白。
     if ($fetchText -match 'PROGRESS_INTERVAL_MS' -and $fetchText -match 'IS_TTY') {
         Write-Host '  [PASS] fetch.mjs 在非交互场景输出整行进度' -ForegroundColor Green
     } else {
@@ -307,26 +280,29 @@ if (-not (Test-Path $libPath)) {
 $script:Results += [pscustomobject]@{ Name = '预检：脚本编码与语法'; Passed = $scriptOk }
 
 # ---------------------------------------------------------------------------
-Invoke-Suite -Name '1/7 依赖导入体检' -File 'check_imports.py'
+Invoke-Suite -Name '1/9 依赖导入体检' -File 'check_imports.py'
 
 # ---------------------------------------------------------------------------
-Invoke-Suite -Name '2/7 离线核心链路（嵌入 + FAISS + 切分）' -File 'test_offline.py'
+Invoke-Suite -Name '2/9 离线核心链路（嵌入 + FAISS + 切分）' -File 'test_offline.py'
 
 # ---------------------------------------------------------------------------
-Invoke-Suite -Name '3/7 RAG 端到端（假 LLM）' -File 'test_e2e.py'
+Invoke-Suite -Name '3/9 RAG 端到端（假 LLM）' -File 'test_e2e.py'
+
+# 索引一致性：换模型 / 改切分参数 / 清空知识库之后，索引与配置还对得上吗。
+# 专盯「不报错但结果已经不对」的静默故障，故自带 RAG_DATA_DIR 隔离（见文件头）。
+Invoke-Suite -Name '4/9 索引一致性与配置对称性' -File 'test_index_consistency.py'
 
 # ---------------------------------------------------------------------------
-Invoke-Suite -Name '4/7 Ollama 集成（协议兼容假服务）' -File 'test_ollama_integration.py'
+Invoke-Suite -Name '5/9 Ollama 集成（协议兼容假服务）' -File 'test_ollama_integration.py'
 
 # ---------------------------------------------------------------------------
 if ($SkipHttp) {
     Write-Host ''
-    Write-Host '5/7 HTTP 层验收 —— 已跳过 (-SkipHttp)' -ForegroundColor Yellow
-    $script:Results += [pscustomobject]@{ Name = '5/7 HTTP 层验收'; Passed = $null }
+    Write-Host '6/9 HTTP 层验收 —— 已跳过 (-SkipHttp)' -ForegroundColor Yellow
+    $script:Results += [pscustomobject]@{ Name = '6/9 HTTP 层验收'; Passed = $null }
 } else {
-    # HTTP 验收会 DELETE /api/documents（清空知识库），所以**必须**跑在临时
-    # 数据目录上：这里总是新起一个专用实例（RAG_DATA_DIR 指向 .tmp），
-    # 绝不复用用户正在使用的服务 —— 以前复用会把用户上传的文档删光。
+    # HTTP 验收会 DELETE /api/documents（清空知识库），所以必须跑在临时数据目录上：
+    # 总是新起专用实例（RAG_DATA_DIR 指向 .tmp），绝不复用用户正在使用的服务。
     $serverProcess = $null
     $testDataDir = Join-Path $PSScriptRoot '..\.tmp\http-suite-data'
     $testDataDir = [System.IO.Path]::GetFullPath($testDataDir)
@@ -356,7 +332,7 @@ if ($SkipHttp) {
     Start-Sleep -Seconds 2
 
     try {
-        Invoke-Suite -Name '5/7 HTTP 层验收（专用临时实例）' -File 'test_http.py' `
+        Invoke-Suite -Name '6/9 HTTP 层验收（专用临时实例）' -File 'test_http.py' `
             -SuiteArgs @('--base', "http://127.0.0.1:$testPort")
     } finally {
         if ($serverProcess -and -not $serverProcess.HasExited) {
@@ -367,37 +343,49 @@ if ($SkipHttp) {
 }
 
 # ---------------------------------------------------------------------------
-# 前端测试：渲染（XSS 转义、引用角标）+ 静态一致性（DOM id / 模块导出）
+# 前端测试：静态一致性（DOM id / 模块导出）+ 真实交互（DOM 垫片里跑 app.js）
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) {
     Write-Host ''
-    Write-Host '6/7 前端测试 —— 已跳过（未找到 node）' -ForegroundColor Yellow
-    $script:Results += [pscustomobject]@{ Name = '6/7 前端测试'; Passed = $null }
+    Write-Host '7/9、8/9 前端测试 —— 已跳过（未找到 node）' -ForegroundColor Yellow
+    $script:Results += [pscustomobject]@{ Name = '7/9 前端测试'; Passed = $null }
+    $script:Results += [pscustomobject]@{ Name = '8/9 前端交互测试'; Passed = $null }
 } else {
     Write-Host ''
     Write-Host ('=' * 74) -ForegroundColor DarkGray
-    Write-Host '  6/7 前端测试（渲染 + 静态一致性）' -ForegroundColor Cyan
+    Write-Host '  7/9 前端测试（渲染 + 静态一致性）' -ForegroundColor Cyan
     Write-Host ('=' * 74) -ForegroundColor DarkGray
 
     & node (Join-Path $PSScriptRoot 'test_frontend.mjs')
     $script:Results += [pscustomobject]@{
-        Name   = '6/7 前端测试'
+        Name   = '7/9 前端测试'
+        Passed = ($LASTEXITCODE -eq 0)
+    }
+
+    # 静态检查证明代码自洽，证明不了行为：这一套把真实的 app.js 装进
+    # tests/dom-lite.mjs 的 DOM 垫片里跑，断言点击/输入/流式渲染真正发生了什么。
+    Write-Host ''
+    Write-Host ('=' * 74) -ForegroundColor DarkGray
+    Write-Host '  8/9 前端交互测试（真实 DOM + 假后端）' -ForegroundColor Cyan
+    Write-Host ('=' * 74) -ForegroundColor DarkGray
+
+    & node (Join-Path $PSScriptRoot 'test_frontend_interaction.mjs')
+    $script:Results += [pscustomobject]@{
+        Name   = '8/9 前端交互测试'
         Passed = ($LASTEXITCODE -eq 0)
     }
 }
 
-# ---------------------------------------------------------------------------
-# 一体化启动器：用户双击的那个 RAG-QA.exe。
-# 它坏了主程序测试全绿也发现不了（用户连界面都进不去），所以单独验收：
-# 编译产物新鲜度、--status 自检、GUI 窗口是否建得出来、--start/--stop 闭环。
+# 一体化启动器：用户双击的 RAG-QA.exe。它坏了主程序测试全绿也发现不了，
+# 所以单独验收：产物新鲜度、--status 自检、GUI 窗口、--start/--stop 闭环。
 Write-Host ''
 Write-Host ('=' * 74) -ForegroundColor DarkGray
-Write-Host '  7/7 一体化启动器（RAG-QA.exe）' -ForegroundColor Cyan
+Write-Host '  9/9 一体化启动器（RAG-QA.exe）' -ForegroundColor Cyan
 Write-Host ('=' * 74) -ForegroundColor DarkGray
 
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_launcher.ps1')
 $script:Results += [pscustomobject]@{
-    Name   = '7/7 一体化启动器'
+    Name   = '9/9 一体化启动器'
     Passed = ($LASTEXITCODE -eq 0)
 }
 

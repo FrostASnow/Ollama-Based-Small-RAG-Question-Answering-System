@@ -1,22 +1,8 @@
 """服务就绪后自动打开浏览器。
 
-为什么需要它
-------------
-``scripts/start.ps1`` 以前用「延时 3 秒再 start 浏览器」的土办法。实测这台机器
-上后端冷启动要约 9 秒，于是浏览器打开时端口还没监听，用户先看到 Chrome 的
-「127.0.0.1 拒绝连接 / ERR_CONNECTION_REFUSED」，很自然地误判成启动失败。
-
-现在改成**由服务自己判断就绪**：真的能用 HTTP 拿到 2xx 响应了，再去开浏览器。
-判断依据是「实际请求一次目标地址」，而不是猜一个等待时间。这样无论机器快慢、
-无论端口被换成多少，都不会再出现「先弹错误页」的体验。
-
-约定
-----
-* 是否自动打开由环境变量/配置 ``RAG_OPEN_BROWSER_URL`` 决定（``start.ps1`` 会填入
-  实际访问地址；留空则完全不做事，保证测试与手动启动 uvicorn 时不弹窗）。
-* 探测走本机回环地址，并**显式禁用代理解析** —— 否则设置了 ``HTTP_PROXY``
-  的环境会把 127.0.0.1 的请求也交给代理，永远探测不到本机服务。
-* 全程不阻塞事件循环：实际请求放在工作线程里执行。
+以「真的请求一次目标地址、拿到 2xx」判断就绪（而不是猜一个等待时间）；探测走本机
+回环并显式禁用代理解析（否则 ``HTTP_PROXY`` 会把 127.0.0.1 的请求也交给代理），
+实际请求放工作线程，不阻塞事件循环。
 """
 
 from __future__ import annotations
@@ -30,7 +16,7 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-#: 最长等待就绪时间。冷启动通常 2 秒内就好，留足余量覆盖杀毒软件体检等情况。
+#: 最长等待就绪时间（留足余量，覆盖杀毒软件体检等慢启动情况）
 DEFAULT_TIMEOUT_S = 120.0
 #: 轮询间隔
 POLL_INTERVAL_S = 0.3
@@ -64,10 +50,7 @@ async def wait_until_ready(
     interval: float = POLL_INTERVAL_S,
     probe_func: Callable[[str], bool] | None = None,
 ) -> float | None:
-    """轮询直到 ``url`` 返回 2xx。
-
-    返回等待耗时（秒）；超时返回 ``None``。
-    """
+    """轮询直到 ``url`` 返回 2xx：返回等待耗时（秒），超时返回 ``None``。"""
     check = probe_func or _probe
     started = time.perf_counter()
     deadline = started + timeout
@@ -88,10 +71,7 @@ def _default_opener(url: str) -> bool:
 
 
 def open_browser(url: str, opener: Callable[[str], bool] | None = None) -> bool:
-    """用系统默认浏览器打开 ``url``。
-
-    ``opener`` 仅用于测试注入，避免单元测试真的弹出浏览器窗口。
-    """
+    """用系统默认浏览器打开 ``url``；``opener`` 仅用于测试注入，避免真的弹窗。"""
     opener = opener or _open_url or _default_opener
     try:
         return bool(opener(url))
@@ -112,10 +92,8 @@ async def _auto_open(url: str, timeout: float = DEFAULT_TIMEOUT_S) -> None:
 
 
 def schedule_auto_open(url: str, enabled: bool = True) -> asyncio.Task[None] | None:
-    """按需调度「就绪后自动打开浏览器」。
+    """按需调度「就绪后自动打开浏览器」；``url`` 为空或 ``enabled`` 为假时返回 ``None``。
 
-    ``url`` 为空、或 ``enabled`` 为假时返回 ``None``，什么都不做
-    （默认行为；测试与直接跑 uvicorn 都属于这种情况）。
     必须在事件循环内调用 —— lifespan 正好满足。
     """
     if not url or not enabled:

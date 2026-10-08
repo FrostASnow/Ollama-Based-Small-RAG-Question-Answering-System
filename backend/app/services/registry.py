@@ -1,7 +1,5 @@
 """文档注册表：记录每个上传文档的元信息与其在 FAISS 中的 chunk id。
-
-持久化到 ``data/index/registry.json``，采用「写临时文件 + 原子替换」，
-避免进程被强杀时把注册表写坏。
+持久化到 ``data/index/registry.json``，用「临时文件 + os.replace」原子替换以防写坏。
 """
 
 from __future__ import annotations
@@ -18,7 +16,21 @@ from app.core.paths import REGISTRY_FILE
 
 logger = get_logger(__name__)
 
-_SCHEMA_VERSION = 1
+# 版本 2：索引元信息里增加了切分参数与解析开关。旧文件不必迁移：
+# 读取一律走 .get()，缺的字段就是 None（=「不知道」）。
+_SCHEMA_VERSION = 2
+
+#: 「这份索引是用什么建出来的」的全部登记项。
+#: 它们描述的是**磁盘上那份索引**，所以知识库清空时必须一起清掉，
+#: 否则会留下指向已不存在的索引的过期元信息。
+_INDEX_META_KEYS = (
+    "embedding_model",
+    "dimension",
+    "chunk_size",
+    "chunk_overlap",
+    "parse_options",
+    "indexed_at",
+)
 
 
 class DocumentRegistry:
@@ -56,6 +68,8 @@ class DocumentRegistry:
     def save(self) -> None:
         with self._lock:
             self._path.parent.mkdir(parents=True, exist_ok=True)
+            # 落盘的文件永远标成当前版本：旧文件在下次保存时就地升级
+            self._data["version"] = _SCHEMA_VERSION
             tmp = self._path.with_suffix(".json.tmp")
             tmp.write_text(
                 json.dumps(self._data, ensure_ascii=False, indent=2),
@@ -64,17 +78,34 @@ class DocumentRegistry:
             os.replace(tmp, self._path)
 
     # ------------------------------------------------------------------
-    def set_index_meta(self, embedding_model: str, dimension: int) -> None:
+    def set_index_meta(
+        self,
+        embedding_model: str,
+        dimension: int,
+        *,
+        chunk_size: int | None = None,
+        chunk_overlap: int | None = None,
+        parse_options: dict[str, Any] | None = None,
+    ) -> None:
+        """登记「这份索引是用什么建出来的」，包含切分参数与解析开关，以便体检发现配置漂移。"""
         with self._lock:
             self._data["embedding_model"] = embedding_model
             self._data["dimension"] = dimension
+            self._data["chunk_size"] = chunk_size
+            self._data["chunk_overlap"] = chunk_overlap
+            self._data["parse_options"] = dict(parse_options) if parse_options else None
+            self._data["indexed_at"] = now_iso()
 
     def get_index_meta(self) -> dict[str, Any]:
         with self._lock:
-            return {
-                "embedding_model": self._data.get("embedding_model"),
-                "dimension": self._data.get("dimension"),
-            }
+            return {key: self._data.get(key) for key in _INDEX_META_KEYS}
+
+    def clear_index_meta(self) -> None:
+        """只清索引元信息，不动文档列表（删掉最后一个文档时用）。"""
+        with self._lock:
+            for key in _INDEX_META_KEYS:
+                self._data[key] = None
+            self.save()
 
     # ------------------------------------------------------------------
     def add(self, doc: dict[str, Any]) -> None:
@@ -110,8 +141,11 @@ class DocumentRegistry:
             return sum(int(d.get("chunk_count", 0)) for d in self._data["documents"].values())
 
     def clear(self) -> None:
+        """清空知识库：文档列表**和索引元信息**一起清，否则会留下指向已删索引的过期登记。"""
         with self._lock:
             self._data["documents"] = {}
+            for key in _INDEX_META_KEYS:
+                self._data[key] = None
             self.save()
 
     def stats(self) -> dict[str, Any]:

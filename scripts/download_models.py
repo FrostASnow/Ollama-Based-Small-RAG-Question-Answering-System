@@ -26,9 +26,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# 把 HuggingFace 的缓存/日志全部重定向到项目内。
-# 默认位置是 %USERPROFILE%\.cache\huggingface，在受限环境或共享机器上可能不可写；
-# 放到项目里同时也让整个程序更自包含、便于整体拷贝到离线机器。
+# HF 缓存/日志重定向到项目内：默认位置 %USERPROFILE%\.cache\huggingface 在受限环境
+# 可能不可写，放在项目里也让整个程序便于整体拷贝到离线机器。
 _HF_HOME = PROJECT_ROOT / ".hf-cache"
 os.environ.setdefault("HF_HOME", str(_HF_HOME))
 os.environ.setdefault("HF_HUB_CACHE", str(_HF_HOME / "hub"))
@@ -37,7 +36,7 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 DEFAULT_REPO = "sentence-transformers/all-MiniLM-L6-v2"
 
-# 只取推理真正需要的文件，跳过 onnx / openvino / tensorflow 等冗余格式（省约 100MB）
+# 只取推理真正需要的文件，跳过 onnx / openvino / tensorflow 等冗余格式
 ALLOW_PATTERNS = [
     "config.json",
     "config_sentence_transformers.json",

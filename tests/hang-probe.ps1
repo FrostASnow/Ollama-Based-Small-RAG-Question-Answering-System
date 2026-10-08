@@ -1,12 +1,8 @@
 ﻿# ============================================================================
 #  hang-probe.ps1 —— 量化 GUI 窗口的「未响应」情况
-#
-#  原理：Windows 判定「未响应」靠的就是「窗口线程 5 秒内没取消息」。
-#  这里用 SendMessageTimeout(WM_NULL) 主动探活：超时即说明 UI 线程被占住。
-#  每 250ms 采一次，记录被阻塞的次数与最长阻塞时长。
-#
-#  用法：
-#    powershell -NoProfile -ExecutionPolicy Bypass -File hang-probe.ps1 [-Seconds 30]
+#  用法：powershell -NoProfile -ExecutionPolicy Bypass -File hang-probe.ps1 [-Seconds 30]
+#  Windows 判定「未响应」靠「窗口线程 5 秒内没取消息」；这里用
+#  SendMessageTimeout(WM_NULL) 主动探活，超时即说明 UI 线程被占住。
 # ============================================================================
 
 [CmdletBinding()]

@@ -1,9 +1,6 @@
 /**
- * 极简 Markdown 渲染器（零依赖，离线可用）。
- *
- * 安全策略：**先转义 HTML，再做 Markdown 替换**。
- * 因此文档或模型输出里的 `<script>` 只会以纯文本呈现，不会被执行。
- * 只实现 RAG 回答里真正会出现的语法子集，避免引入 marked/markdown-it 等外部包。
+ * 极简 Markdown 渲染器（零依赖）。
+ * 安全策略：先转义 HTML 再做替换，所以输出里的 <script> 只会是纯文本。
  */
 
 const ESCAPES = {
@@ -68,15 +65,12 @@ function indentWidth(prefix) {
 }
 
 const BULLET_MARKER = /^([ \t]*)([-*+•·])\s+(.*)$/;
-// 兼容模型实际会写出的各种序号：`1.` `1．` `1、` `1)` `（1）`，以及中文里
-// 「1．标题」这种**序号后没有空格**的写法。
+// 兼容模型实际会写出的各种序号：`1.` `1．` `1、` `1)` `（1）`，以及序号后没有空格的写法。
 const ORDERED_MARKER = /^([ \t]*)(\d{1,3})([.．、)）])(\s*)(.*)$/;
 
 /**
  * 解析列表项行；不是列表项则返回 null。
- *
- * 这里刻意要求「序号后面必须有标点」，否则正文里的「2020 年第 2 期」
- * 「图 8 每张图」都会被误判成列表项。
+ * 刻意要求序号后必须有标点，否则「2020 年第 2 期」会被误判成列表项。
  */
 export function matchListItem(line) {
   const bullet = line.match(BULLET_MARKER);
@@ -115,8 +109,8 @@ function serializeItem(item) {
   const parts = item.parts.map((part) => renderInline(part));
   let html = parts[0] || '';
   for (let i = 1; i < parts.length; i += 1) {
-    // 续行（模型常见的「- **要点**」换行后接说明）放在同一个 <li> 里，
-    // 否则每个要点都会变成一个独立的单元素列表，序号全是 1。
+    // 续行（「- **要点**」换行后接说明）要留在同一个 <li> 里，
+    // 否则每个要点都会变成独立的单元素列表，序号全是 1。
     html += `<br />${parts[i]}`;
   }
   for (const child of item.children) html += serializeFrame(child);
@@ -132,13 +126,7 @@ function serializeFrame(frame) {
 
 /**
  * 从 start 行开始解析一整块列表，返回 `{ html, next }`。
- *
- * 与最初的实现相比，这里修掉了三个真实故障：
- *   1. 空行会关闭列表 → 每个要点各自成为一个 `<ol>`，浏览器把**每一段**都编号成 1。
- *      现在空行只把列表标记为「松散」，序号继续往下排。
- *   2. 缩进的续行被当成普通段落 → 说明文字跑到列表外面，和要点脱节。
- *      现在缩进 ≥ 内容列（或无空行的紧跟随行）都归入当前 `<li>`。
- *   3. 完全没有嵌套支持 → 子列表被拉平成同级项。现在按缩进建树。
+ * 空行不关闭列表，缩进或紧跟随行归入当前条目，缩进更深则建子列表。
  */
 function parseListBlock(lines, start) {
   const rootLists = [];
@@ -207,11 +195,7 @@ function parseListBlock(lines, start) {
   return { html: rootLists.map(serializeFrame).join('\n'), next: index };
 }
 
-/**
- * 把 Markdown 文本渲染成 HTML 字符串。
- * @param {string} source
- * @returns {string}
- */
+/** 把 Markdown 文本渲染成 HTML 字符串。 */
 export function renderMarkdown(source) {
   const lines = String(source ?? '').replace(/\r\n?/g, '\n').split('\n');
   const html = [];
@@ -325,10 +309,7 @@ export function renderMarkdown(source) {
   return html.join('\n');
 }
 
-/**
- * 用于流式输出的轻量纯文本转义（不解析 Markdown，避免半截语法闪烁）。
- * 保留换行。
- */
+/** 流式输出的轻量纯文本转义（不解析 Markdown，避免半截语法闪烁）；保留换行。 */
 export function renderPlain(text) {
   return `<p>${escapeHtml(text).replace(/\n/g, '<br />')}</p>`;
 }

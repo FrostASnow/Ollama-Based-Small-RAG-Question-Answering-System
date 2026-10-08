@@ -24,7 +24,7 @@
       <button class="icon-btn" id="toggleSidebar" title="收起/展开侧栏" aria-label="收起侧栏">‹</button>
     </header>
 
-    <!-- 配置未完成时的常驻入口（点击可重新打开引导弹窗） -->
+    <!-- 配置未完成时的常驻入口 -->
     <button class="setup-banner" id="setupBanner" hidden type="button">
       <span class="setup-banner__icon" aria-hidden="true">!</span>
       <span class="setup-banner__text">
@@ -33,7 +33,6 @@
       </span>
     </button>
 
-    <!-- 上传 -->
     <section class="panel">
       <h2 class="panel__title">知识库</h2>
       <div class="dropzone" id="dropzone" tabindex="0" role="button"
@@ -54,7 +53,6 @@
       </div>
     </section>
 
-    <!-- 文档列表 -->
     <section class="panel panel--grow">
       <div class="panel__title-row">
         <h2 class="panel__title">
@@ -68,7 +66,6 @@
       <p class="empty-hint" id="docEmpty">还没有文档，先上传一些资料吧。</p>
     </section>
 
-    <!-- 检索参数 -->
     <section class="panel">
       <h2 class="panel__title">检索参数</h2>
       <div class="field">
@@ -177,7 +174,7 @@
       <div class="setup-loading"><span class="dots"><span></span><span></span><span></span></span></div>
     </div>
 
-    <!-- 一键安装：实时日志控制台 -->
+    <!-- 一键安装：实时日志 -->
     <div class="modal__body modal__body--install" id="setupInstallPanel" hidden>
       <div class="install-head">
         <span class="install-state" id="installState">正在准备环境…</span>
@@ -189,7 +186,7 @@
       </p>
       <pre class="install-log" id="installLog" aria-live="polite"></pre>
 
-      <!-- 失败后的出路：不能只丢一句 WARN 让用户干瞪眼 -->
+      <!-- 失败后的出路 -->
       <div class="install-actions" id="installActions" hidden>
         <p class="install-actions__hint" id="installActionHint"></p>
         <div class="install-actions__row">

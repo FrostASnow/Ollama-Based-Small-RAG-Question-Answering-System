@@ -1,16 +1,12 @@
 """首次配置体检：检测缺失组件，并生成**可直接复制执行**的安装指引。
 
-为什么放在后端而不是前端
-------------------------
-安装命令里的路径（项目位置、ollama.exe 落在哪、脚本在哪）都是部署相关的。
-由后端按当前实际安装位置生成，前端只负责展示，可以避免：
-  * 前端硬编码路径，换个目录部署就失效；
-  * 命令与配置文件（模型名、端口）不一致；
-  * 换了 Ollama 的获取方式后，文档更新了但界面没更新。
-"""
+指引由后端按当前实际安装位置生成、前端只负责展示：安装命令里的路径（项目位置、
+ollama.exe 落在哪、脚本在哪）都是部署相关的，硬编码在前端换个目录就失效，也容易
+与配置里的模型名/端口不一致。"""
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import sys
@@ -28,8 +24,8 @@ logger = get_logger(__name__)
 PORTABLE_DIR = PROJECT_ROOT / "tools" / "ollama"
 PORTABLE_EXE = PORTABLE_DIR / "ollama.exe"
 PORTABLE_ZIP = PROJECT_ROOT / "tools" / "ollama-windows-amd64.zip"
-#: 便携版把推理引擎（llama-server）及其依赖放在这个子目录里。
-#: 只有 ollama.exe 而没有它是**不能推理**的 —— 见 portable_ollama_status()。
+#: 便携版把推理引擎（llama-server）及其依赖放在这个子目录里：只有 ollama.exe
+#: 而没有它是**不能推理**的，见 portable_ollama_status()。
 OLLAMA_RUNTIME_SUBDIR = Path("lib") / "ollama"
 OLLAMA_RUNNER_NAMES = ("llama-server.exe", "ollama-llama-server.exe")
 PREPARE_SCRIPT = PROJECT_ROOT / "scripts" / "prepare.ps1"
@@ -51,11 +47,7 @@ def _ps(command: str, label: str = "在 PowerShell 中执行", note: str | None 
 
 
 def _run_ps1(script: Path, extra: str = "") -> str:
-    """生成调用 .ps1 的命令。
-
-    刻意用 `powershell` 而不是 `pwsh`：Windows 自带前者，
-    很多机器上并没有装 PowerShell 7。
-    """
+    """生成调用 .ps1 的命令。刻意用 `powershell` 而不是 `pwsh`：Windows 自带前者。"""
     tail = f" {extra}".rstrip()
     return f'powershell -NoProfile -ExecutionPolicy Bypass -File "{script}"{tail}'
 
@@ -70,7 +62,7 @@ def _quote(path: Path | str) -> str:
 def detect_ollama_binary() -> dict[str, Any]:
     """查找可用的 ollama.exe，返回 ``{found, path, source}``。
 
-    顺序与 start.ps1 保持一致：项目内置 → PATH → 常见安装位置。
+    查找顺序与 start.ps1 保持一致：项目内置 → PATH → 常见安装位置。
     """
     local_appdata = os.environ.get("LOCALAPPDATA", "")
     program_files = os.environ.get("ProgramFiles", "")
@@ -100,18 +92,9 @@ def detect_ollama_binary() -> dict[str, Any]:
 def portable_ollama_status(portable_dir: Path | None = None) -> dict[str, Any]:
     """检查项目内置的便携版 Ollama 是否**完整**。
 
-    为什么必须单独检查：解压不完整时（只出来一个 ollama.exe），
-    `ollama serve` 照样能启动、`/api/tags` 也照样能列出模型 ——
-    所有「看起来正常」的迹象都在，唯独一发提问就 500：
-
-        error starting llama-server: llama-server binary not found
-        (checked: tools\\ollama\\lib\\ollama\\llama-server.exe, ...)
-
-    也就是说，只看「进程在不在、模型列不列得出来」是查不出这个故障的，
-    必须去看推理引擎文件是否真的存在。
-
-    ``complete`` 为 ``None`` 表示无法判断（不是便携版布局，例如官方安装包），
-    这时刻意不下结论，避免误报把用户引到错误的方向。
+    解压不完整时（只剩 ollama.exe）服务照样能起、/api/tags 照样能列出模型，唯独一发
+    提问就报 "llama-server binary not found"，所以必须查推理引擎文件是否存在。
+    ``complete`` 为 ``None`` 表示不是便携版布局（如官方安装包），刻意不下结论以免误报。
     """
     directory = portable_dir if portable_dir is not None else PORTABLE_DIR
     exe = directory / "ollama.exe"
@@ -135,8 +118,8 @@ def portable_ollama_status(portable_dir: Path | None = None) -> dict[str, Any]:
 
     status["runtime_files"] = len(files)
     status["runners"] = runners
-    # 判定标准刻意宽松一点：优先认推理引擎本体；万一日后改名，
-    # 只要运行时目录里确实有一批文件（而不是空目录），就不误报。
+    # 判定标准刻意宽松：优先认推理引擎本体；万一日后改名，只要运行时目录里确实
+    # 有一批文件（而不是空目录）就不误报。
     status["complete"] = bool(runners) or len(files) >= 3
     return status
 
@@ -146,7 +129,6 @@ def _venv_python() -> Path:
 
 
 def _probe_tool(name: str, extra_candidates: list[Path | None]) -> dict[str, Any]:
-    """在 PATH 和若干常见安装位置里找一个可执行文件。"""
     found = shutil.which(name)
     if found:
         return {"found": True, "path": found, "source": "PATH"}
@@ -161,9 +143,8 @@ def _probe_tool(name: str, extra_candidates: list[Path | None]) -> dict[str, Any
 def detect_toolchain() -> dict[str, Any]:
     """探测本机可用的辅助工具。
 
-    用途：同一套安装指引在不同机器上的「最省事路径」并不一样 ——
-    装了 uv 的机器可以完全自动准备；没装 uv 但装了 Python 也能走 pip。
-    把这些探测结果摆给用户看，指引才算真正「因地制宜」。
+    同一套安装指引在不同机器上的「最省事路径」不一样（有 uv 可全自动，只有 Python 走 pip），
+    摆出探测结果，指引才算因地制宜。
     """
     home = Path(os.environ["USERPROFILE"]) if os.environ.get("USERPROFILE") else None
     local_appdata = os.environ.get("LOCALAPPDATA", "")
@@ -202,7 +183,7 @@ def detect_toolchain() -> dict[str, Any]:
 
 
 def _python_cmd() -> str:
-    """优先用项目 venv 的 python，退回到当前解释器。"""
+    """优先用项目 venv 的 python，退回当前解释器。"""
     venv = _venv_python()
     exe = venv if venv.is_file() else Path(sys.executable)
     return _quote(exe)
@@ -237,7 +218,6 @@ def _embedding_options() -> list[SetupOption]:
 
 
 def _ollama_missing_options() -> list[SetupOption]:
-    """Ollama 完全没装时的三种获取方式。"""
     return [
         SetupOption(
             id="prepare",
@@ -301,7 +281,6 @@ def _ollama_missing_options() -> list[SetupOption]:
 
 
 def _ollama_incomplete_options(binary: dict[str, Any], status: dict[str, Any]) -> list[SetupOption]:
-    """Ollama 装了一半：只有 ollama.exe，没有推理引擎。"""
     return [
         SetupOption(
             id="repair",
@@ -358,7 +337,6 @@ def _ollama_incomplete_options(binary: dict[str, Any], status: dict[str, Any]) -
 
 
 def _ollama_not_running_options(binary: dict[str, Any]) -> list[SetupOption]:
-    """Ollama 已安装但服务没起来。"""
     exe = binary.get("path") or "ollama"
     return [
         SetupOption(
@@ -421,13 +399,30 @@ async def build_report(fresh: bool = False) -> SetupReport:
     from app.services import ollama_client
 
     if fresh:
-        ollama_client.invalidate_cache()
+        # 点「重新检测」通常意味着刚装完东西（很可能刚 ollama pull），两个缓存都要清：
+        # 可达性与模型列表、以及模型能力（是否支持 thinking）。
+        ollama_client.invalidate_all()
 
     reachable, model_names = await ollama_client.probe()
     model_ok = ollama_client.model_is_available(settings.llm_model, model_names)
     binary = detect_ollama_binary()
     embedding_ready = settings.is_embedding_ready()
     venv_ready = _venv_python().is_file()
+
+    # 「文件在」不等于「能加载」：模型目录可能是坏的（权重下载到一半、依赖版本不兼容），
+    # 这里真加载一次，把失败原因摆进报告，而不是等用户第一次提问才炸在半路。
+    # 加载 sentence-transformers 是 CPU 密集的阻塞操作，必须放线程里，否则会卡住事件循环。
+    embedding_loadable: bool | None = None
+    embedding_error: str | None = None
+    if embedding_ready:
+        from app.services.embeddings import try_get_embeddings
+
+        embeddings = await asyncio.to_thread(try_get_embeddings)
+        embedding_loadable = embeddings is not None
+        if not embedding_loadable:
+            from app.services.embeddings import embedding_status
+
+            embedding_error = embedding_status().get("error") or "未知原因"
 
     issues: list[SetupIssue] = []
 
@@ -446,8 +441,22 @@ async def build_report(fresh: bool = False) -> SetupReport:
                 options=_embedding_options(),
             )
         )
+    elif embedding_loadable is False:
+        issues.append(
+            SetupIssue(
+                id="embedding_broken",
+                severity="blocking",
+                title="本地嵌入模型存在但加载失败",
+                detail=(
+                    f"在 {settings.embedding_dir} 找到了模型文件，但加载时报错：{embedding_error}。"
+                    "常见原因是权重文件下载不完整，或依赖版本不匹配。"
+                ),
+                impact="上传文档与提问都会失败",
+                options=_embedding_options(),
+            )
+        )
 
-    # 依赖没装好时，上面那些命令也跑不起来，单独提示
+    # 依赖没装好时上面的命令也跑不起来，单独提示
     if not venv_ready:
         issues.append(
             SetupIssue(
@@ -505,9 +514,8 @@ async def build_report(fresh: bool = False) -> SetupReport:
             )
         )
     elif portable["present"] and portable["complete"] is False:
-        # 最容易被忽略的一种：服务能起来、模型也列得出来，但推理引擎文件缺失。
-        # 必须排在「服务未启动 / 缺模型」之前单独报出来，否则用户会一直
-        # 以为自己只是没拉模型。
+        # 服务能起来、模型也列得出来，但推理引擎缺失 —— 这是最容易被忽略的一种，
+        # 必须排在「服务未启动 / 缺模型」之前单独报出来，否则用户会一直以为只是没拉模型。
         issues.append(
             SetupIssue(
                 id="ollama_incomplete",
@@ -581,6 +589,8 @@ async def build_report(fresh: bool = False) -> SetupReport:
             "embedding_model": settings.embedding_model_name,
             "embedding_dir": str(settings.embedding_dir),
             "embedding_ready": embedding_ready,
+            "embedding_loadable": embedding_loadable,
+            "embedding_error": embedding_error,
             "venv_ready": venv_ready,
             "prepare_script": str(PREPARE_SCRIPT),
             "portable_dir": str(PORTABLE_DIR),

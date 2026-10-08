@@ -1,18 +1,8 @@
 ﻿# ============================================================================
 #  test_launcher.ps1 —— 一体化启动器 RAG-QA.exe 的验收
-#
-#  为什么单独测启动器：它是「用户双击的那个东西」，一旦坏了，
-#  用户连界面都进不去，而主程序的测试全绿也发现不了。
-#
-#  覆盖：
-#    * 源码编码（.cs 必须带 BOM，否则 csc 按 GBK 读，中文界面全乱码）
-#    * exe 存在且比源码新（改代码忘了重新编译是最容易犯的错）
-#    * --status / --status --json 的自检输出
-#    * --start / --status / --stop 完整闭环（**隔离数据目录**，不碰真实知识库）
-#    * 关掉 GUI 面板不会误启服务；--stop 默认不动 Ollama（本测试加 -KeepOllama）
-#
-#  用法：
-#    powershell -NoProfile -ExecutionPolicy Bypass -File tests\test_launcher.ps1
+#  用法：powershell -NoProfile -ExecutionPolicy Bypass -File tests\test_launcher.ps1
+#  覆盖：.cs 编码（BOM）、exe 新鲜度、--status/--json 自检、--start/--status/--stop
+#  闭环（隔离数据目录，不碰真实知识库）、关闭面板不误启服务。
 # ============================================================================
 
 [CmdletBinding()]
@@ -55,14 +45,9 @@ function Section([string]$Title) {
     Write-Host ('-' * 70)
 }
 
-# 调用 exe 并取回 stdout。
-# 两个坑：
-#   1. PowerShell 不等待 GUI 子系统的程序：直接 & 调用会立刻返回，
-#      $LASTEXITCODE 是空的、输出也拿不到 —— 必须借道 cmd（它是控制台程序）。
-#   2. 不能用 Start-Process -RedirectStandardOutput：受限环境里会「拒绝访问」
-#      （.NET 的进程重定向在 Windows 上走匿名管道，而沙箱禁掉了命名管道）。
-#      改用 cmd 的 `> 文件`：由 cmd 直接把文件句柄交给子进程，不经过管道。
-#   另外必须放到后台作业里执行：cmd 会一直等到 exe 结束，而 --start 最长等 120 秒。
+# 调用 exe 并取回 stdout。PowerShell 不等待 GUI 子系统程序（直接 & 会立刻返回、
+# $LASTEXITCODE 为空），必须借道 cmd；也不能用 Start-Process -RedirectStandardOutput
+# （受限环境走命名管道会「拒绝访问」），改用 cmd 的 `> 文件`，并放到后台作业执行。
 function Invoke-Launcher([string[]]$Arguments, [int]$TimeoutSec = 180) {
     $stdout = Join-Path $TmpRoot 'launcher-stdout.txt'
     $stderr = Join-Path $TmpRoot 'launcher-stderr.txt'
@@ -112,14 +97,9 @@ function Find-FreePort([int]$Start) {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# UI 线程响应性采样
-# ---------------------------------------------------------------------------
-# 用户实测：「使用过程中疯狂未响应」。根因是刷新定时器在 UI 线程上顺序探测
-# 约 21 个端口，而本机对一个**关闭**端口发起连接要等满 2 秒（SYN 被静默丢弃、
-# 不回 RST），一个刷新周期就是几十秒 —— 窗口自然一直「未响应」。
-# Windows 判定「未响应」的标准就是「窗口线程 5 秒内没取消息」，
-# 这里用 SendMessageTimeout(WM_NULL) 主动探活，把它变成可回归的断言。
+# UI 线程响应性采样：网络探测绝不能放在 UI 线程上（对关闭端口发起连接可能等满 2 秒，
+# 一个刷新周期就是几十秒 → 窗口「未响应」）。Windows 以「窗口线程 5 秒内没取消息」
+# 判定未响应，这里用 SendMessageTimeout(WM_NULL) 主动探活，做成可回归的断言。
 $probeReady = $false
 try {
     Add-Type -TypeDefinition @'
@@ -262,10 +242,9 @@ Check '--status 文本模式输出中文正常' ($statusText.StdOut -match '项�
 # ---------------------------------------------------------------------------
 Section '3. GUI 面板冒烟 + UI 响应性（服务未运行时）'
 
-# 为什么不用 Process.MainWindowTitle：它只报告**可见**的主窗口。
-# 在无人交互的会话（CI、远程、沙箱）里窗口对象能建出来但不会真正显示，
-# MainWindowTitle 永远是空 —— 那会把「功能正常」误判成失败。
-# 这里直接枚举该进程的顶层窗口并检查标题文本（探针见文件开头的 Add-Type）。
+# 不用 Process.MainWindowTitle：它只报告可见的主窗口，无人交互的会话（CI、远程、
+# 沙箱）里窗口能建出来但不显示，MainWindowTitle 永远是空 → 会把「功能正常」误判成失败。
+# 这里直接枚举该进程的顶层窗口并检查标题文本。
 $gui = Start-Process -FilePath $Exe -PassThru
 $guiTitle = ''
 $visibleCount = 0
@@ -289,7 +268,7 @@ if ($probeReady -and $guiTitle -and $visibleCount -eq 0) {
 }
 
 if ($probeReady -and -not $gui.HasExited) {
-    # 「服务未运行」是旧代码最糟的场景：完整端口扫描（21 个 × 2 秒连接超时）
+    # 「服务未运行」是旧代码最糟的场景：完整端口扫描（每个端口都要等连接超时）
     Write-Host '  采样 UI 响应性（服务未运行，8 秒）...' -ForegroundColor Gray
     $ui = Measure-Ui -ProcessId $gui.Id -Seconds 8 -ThresholdMs 400
     Check 'UI 线程在服务未运行时保持响应' ($ui.Blocked -eq 0) (

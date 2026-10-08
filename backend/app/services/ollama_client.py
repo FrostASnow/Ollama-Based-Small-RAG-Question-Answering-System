@@ -1,16 +1,8 @@
 """Ollama 服务探测（异步、带短超时与结果缓存）。
 
-只用于健康检查与模型列表，不参与推理（推理走 LangChain 的 ChatOllama）。
-
-设计要点
---------
-Ollama 不可达时，连接尝试要等到超时才返回。健康检查是前端启动时第一个
-调用的接口，如果每次都要串行等两次超时，界面就会「卡住好几秒」。
-因此这里：
-  1. 只发一次请求（/api/tags 成功即视为可达，不额外探测）；
-  2. 超时压到 2 秒；
-  3. 用 TTL 缓存结果，避免前端反复刷新时把等待时间叠加起来。
-"""
+只用于健康检查与模型列表，不参与推理（推理走 LangChain 的 ChatOllama）。Ollama 不可达
+时要等到超时才返回，而健康检查是前端启动时第一个接口，故只发一次请求、超时压到 2 秒、
+结果带 TTL 缓存，避免界面卡住几秒。"""
 
 from __future__ import annotations
 
@@ -31,10 +23,7 @@ _cache: dict[str, Any] = {"at": 0.0, "reachable": False, "names": []}
 
 
 async def probe(base_url: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> tuple[bool, list[str]]:
-    """探测 Ollama 是否可达，并返回已安装模型名列表。
-
-    返回 ``(可达?, 模型名列表)``。命中缓存时不会发起网络请求。
-    """
+    """探测 Ollama 是否可达，返回 ``(可达?, 模型名列表)``；命中缓存时不发网络请求。"""
     url = (base_url or settings.ollama_base_url).rstrip("/")
     now = time.monotonic()
 
@@ -64,6 +53,7 @@ async def probe(base_url: str | None = None, timeout: float = DEFAULT_TIMEOUT) -
 
 
 def invalidate_cache() -> None:
+    """让「可达性 + 模型列表」缓存立刻失效。"""
     _cache["at"] = 0.0
 
 
@@ -92,10 +82,7 @@ async def is_reachable(base_url: str | None = None) -> bool:
 
 
 def model_is_available(model: str, names: list[str]) -> bool:
-    """Ollama 的标签匹配需要宽松一些：
-
-    ``deepseek-r1:1.5b`` 可能被记录成 ``deepseek-r1:1.5b`` 或 ``deepseek-r1:latest``。
-    """
+    """Ollama 标签匹配要宽松：``deepseek-r1:1.5b`` 也可能被记成 ``deepseek-r1:latest``。"""
     if not names:
         return False
     if model in names:
@@ -107,14 +94,11 @@ def model_is_available(model: str, names: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 # 模型能力（是否支持原生 thinking 通道）
 # ---------------------------------------------------------------------------
-# ChatOllama(reasoning=True) 会在请求里带上 think=true，Ollama 于是把思维链
-# 单独放在 message.thinking 里。**不支持思考的模型**（例如 llama3.2）收到这个
-# 字段可能直接报错，所以要先问一下 /api/show 的 capabilities 再决定开不开。
-#
-# 这里是同步接口：调用点在建立 LLM 时的 _build_llm()。结果带 TTL 缓存，
-# 正常只在第一次提问前多花一次本机 HTTP 往返（毫秒级）。
-# ---------------------------------------------------------------------------
-CAPABILITY_TTL_SECONDS = 300.0
+# ChatOllama(reasoning=True) 会带上 think=true，Ollama 于是把思维链单独放进
+# message.thinking；**不支持思考的模型**（如 llama3.2）收到该字段可能直接报错，
+# 所以先查 /api/show 的 capabilities。这里是同步接口（调用点在建立 LLM 时），结果带 TTL 缓存：
+# 用户在面板里重新 pull 或把标签指向新版本后能力可能已变，故 TTL 收到 60 秒。
+CAPABILITY_TTL_SECONDS = 60.0
 _capability_cache: dict[str, tuple[float, bool]] = {}
 
 
@@ -145,20 +129,26 @@ def supports_thinking(model: str, base_url: str | None = None) -> bool:
 
 
 def invalidate_capability_cache() -> None:
+    """清掉「模型是否支持原生 thinking」的缓存。
+
+    凡是「模型集合可能已经变了」的时刻（pull、切模型版本、一键安装结束）都必须调用，
+    否则最长 60 秒内仍按旧结论处理，表现为推理过程一直不显示。
+    """
     _capability_cache.clear()
+
+
+def invalidate_all() -> None:
+    """两个缓存一起清。调用点见 routers/health.py、services/installer.py。"""
+    invalidate_cache()
+    invalidate_capability_cache()
 
 
 # ---------------------------------------------------------------------------
 # 模型预热
 # ---------------------------------------------------------------------------
-# Ollama 是**懒加载**的：服务起来了、模型也列得出来，但权重直到第一次推理
-# 才载入显存。本机实测这一下要 100 秒左右（1.1GB 权重 + CUDA 初始化，
-# 4GB 显存的笔记本 GPU 上还会部分回落到 CPU），之后同一模型只要 0.4 秒。
-# 也就是说「启动服务」和「能提问」之间差着近两分钟。
-#
-# POST /api/generate 不带 prompt 时 Ollama 只加载不生成（返回 done_reason="load"），
-# 正好用来在后台把模型提前载入，等用户真正提问时就已经是热的。
-# ---------------------------------------------------------------------------
+# Ollama 是**懒加载**的：服务起来了、模型也列得出来，但权重直到第一次推理才载入显存，
+# 于是「启动服务」和「能提问」之间差着很久。POST /api/generate 不带 prompt 时只加载不生成
+# （done_reason="load"），正好用来在后台提前把模型载入。
 LLM_WARMUP_TIMEOUT = 600.0
 
 
@@ -168,10 +158,7 @@ async def warmup_model(
     keep_alive: str = "10m",
     timeout: float = LLM_WARMUP_TIMEOUT,
 ) -> bool:
-    """让 Ollama 预先载入模型。成功返回 True。
-
-    失败一律吞掉：这只是优化，不该影响服务启动。
-    """
+    """让 Ollama 预先载入模型。失败一律吞掉：这只是优化，不该影响服务启动。"""
     url = (base_url or settings.ollama_base_url).rstrip("/")
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -191,10 +178,9 @@ async def unload_model(
     base_url: str | None = None,
     timeout: float = 5.0,
 ) -> bool:
-    """让 Ollama 立刻卸载模型（``keep_alive=0``），把显存/内存还回去。
+    """让 Ollama 立刻卸载模型（``keep_alive=0``），把显存还回去。
 
-    程序退出时调用：即使 Ollama 进程本身要保留（用户可能还用它跑别的东西），
-    也不该继续占着这 1GB 左右的显存。
+    程序退出时调用：Ollama 进程本身可能还要保留给别的用途，但不该继续占着显存。
     """
     url = (base_url or settings.ollama_base_url).rstrip("/")
     try:

@@ -1,9 +1,6 @@
 """FastAPI 应用入口。
 
-启动：
-    python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-或直接：
-    python -m app.main
+启动：``python -m uvicorn app.main:app --host 127.0.0.1 --port 8000``，或 ``python -m app.main``。
 """
 
 from __future__ import annotations
@@ -23,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
-# 让 `python backend/app/main.py` 这种直接执行的方式也能 import app.*
+# 直接执行 python backend/app/main.py 时也能 import app.*
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -34,6 +31,7 @@ from app.core.paths import FRONTEND_DIR, ensure_runtime_dirs  # noqa: E402
 from app.routers import chat, documents, health  # noqa: E402
 from app.services import loader, ollama_client  # noqa: E402
 from app.services.embeddings import warmup  # noqa: E402
+from app.services.index_health import health_problems, summarize  # noqa: E402
 from app.services.registry import registry  # noqa: E402
 from app.services.vectorstore import vector_store  # noqa: E402
 
@@ -42,14 +40,10 @@ logger = get_logger("app.main")
 
 
 class UTF8JSONResponse(JSONResponse):
-    """显式声明 ``charset=utf-8`` 的 JSON 响应。
+    """显式声明 ``charset=utf-8`` 的 JSON 响应：Starlette 默认只给 ``text/*`` 追加 charset。
 
-    Starlette 默认只给 ``text/*`` 追加 charset，``application/json`` 不带。
-    这会让部分客户端在解码中文时出错 —— 典型的是 Windows PowerShell 5.1 的
-    ``Invoke-RestMethod``：没有 charset 就按 ISO-8859-1 解码，
-    于是「离线 RAG 文档问答」变成「ç¦»çº¿ RAG ææ¡£é®ç」。
-
-    JSON 规范本来就规定用 UTF-8，显式写出来对所有客户端都更安全。
+    不带 charset 时部分客户端（如 Windows PowerShell 5.1 的 ``Invoke-RestMethod``）
+    会按 ISO-8859-1 解码，中文变成乱码。
     """
 
     media_type = "application/json; charset=utf-8"
@@ -64,8 +58,8 @@ async def lifespan(app: FastAPI):
     logger.info("离线模式：HF_HUB_OFFLINE=%s", __import__("os").environ.get("HF_HUB_OFFLINE"))
     logger.info("LLM 模型：%s @ %s", settings.llm_model, settings.ollama_base_url)
     logger.info("嵌入模型：%s", settings.embedding_source())
-    # 启动脚本会把真实访问地址放进 open_browser_url（含 -Port 指定的端口），
-    # 比 settings.host/port 更准；两者都没有时才回退到配置值。
+    # 启动脚本填入的 open_browser_url（含 -Port 指定的端口）比 settings.host/port 更准，
+    # 两者都没有时才回退到配置值。
     logger.info(
         "访问地址：%s",
         settings.open_browser_url or f"http://{settings.host}:{settings.port}",
@@ -75,16 +69,14 @@ async def lifespan(app: FastAPI):
     async def background_init() -> None:
         """预热嵌入模型并恢复索引。
 
-        放在后台任务里执行：加载 sentence-transformers 会连带导入 torch，
-        冷启动要十几到几十秒。若在 lifespan 里同步等待，端口迟迟不监听，
-        用户看到的是「浏览器无法连接」而不是「正在初始化」。
+        放后台执行：加载 sentence-transformers 会连带导入 torch，冷启动要十几到几十秒，
+        同步等待会让端口迟迟不监听，用户看到的是「无法连接」而不是「正在初始化」。
         """
         try:
             warmed = await asyncio.to_thread(warmup)
             if warmed:
-                # 嵌入模型已进内存，此时补上切分器依赖几乎不花时间
-                # （langchain_text_splitters 会连带拉起整个 sentence_transformers，
-                #   单独导入要 9 秒，所以刻意从模块顶层挪到了这里）。
+                # 此处才导入切分器依赖：它会连带拉起整个 sentence_transformers/torch，
+                # 放模块顶层会明显拖慢冷启动。
                 await asyncio.to_thread(loader.preload)
             await asyncio.to_thread(vector_store.load)
             stats = registry.stats()
@@ -92,6 +84,13 @@ async def lifespan(app: FastAPI):
                 "知识库就绪：%d 个文档 / %d 个分块（向量 %d 条）",
                 stats["document_count"], stats["chunk_count"], vector_store.size,
             )
+
+            # 索引是离线产物：换过嵌入模型 / 改过切分参数后它会与当前配置分叉，
+            # 启动时就说清楚，别等用户提问时才炸在半路。
+            report = await asyncio.to_thread(vector_store.compatibility)
+            for problem in health_problems(report):
+                logger.warning("%s", problem)
+            logger.info("索引一致性：%s", summarize(report))
         except Exception as exc:  # noqa: BLE001
             logger.error("后台初始化失败：%s", exc)
 
@@ -100,9 +99,7 @@ async def lifespan(app: FastAPI):
     async def warmup_llm() -> None:
         """后台把 LLM 预载入显存。
 
-        Ollama 是懒加载的：服务起来了、模型也列得出来，但权重直到第一次推理
-        才载入 —— 本机实测这一下要 100 秒左右，之后只要 0.4 秒。
-        不预热的话，用户的第一条提问就是「点了发送，两分钟没反应」。
+        Ollama 懒加载：权重直到第一次推理才载入，不预热的话用户第一条提问会长时间无响应。
         """
         try:
             reachable, names = await ollama_client.probe()
@@ -138,9 +135,8 @@ async def lifespan(app: FastAPI):
             await task
     logger.info("正在停止服务，持久化索引 ...")
 
-    # 退出时把模型从显存里卸掉。启动脚本随后会连 Ollama 进程一起收掉；
-    # 但如果用户用 -KeepOllama 保留了进程（自己还要用），这一步能保证
-    # 它不会继续占着这 1GB 左右的显存。
+    # 退出时把模型从显存里卸掉：启动脚本通常会连 Ollama 进程一起收掉，
+    # 但 -KeepOllama 保留进程时，这一步能保证它不继续占着显存。
     if settings.warmup_llm:
         try:
             if await ollama_client.unload_model(settings.llm_model):
@@ -190,8 +186,8 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     )
 
 
-# FastAPI 内置的异常处理器直接构造 JSONResponse，绕过了 default_response_class，
-# 而我们的错误信息（404/409/503）里带中文，所以这里显式覆盖成 UTF-8 版本。
+# FastAPI 内置的异常处理器绕过 default_response_class 直接构造 JSONResponse，
+# 而我们的 404/409/503 文案带中文，所以显式覆盖成 UTF-8 版本。
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(
     request: Request, exc: StarletteHTTPException

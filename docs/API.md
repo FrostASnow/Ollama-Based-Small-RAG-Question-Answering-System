@@ -30,25 +30,51 @@
   "chunk_count": 42,
   "detail": {
     "problems": [],
-    "embedding": { "loaded": true, "local_ready": true, "dimension": 384 },
+    "embedding": { "loaded": true, "local_ready": true, "dimension": 384, "actual_dimension": 384 },
     "vector_store": { "ready": true, "vectors": 42 },
-    "index_meta": { "embedding_model": "...", "dimension": 384 }
+    "index_meta": {
+      "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+      "dimension": 384,
+      "chunk_size": 800,
+      "chunk_overlap": 120,
+      "parse_options": { "strip_boilerplate": true, "restore_pdf_paragraphs": true, "strip_references": true },
+      "indexed_at": "2026-01-01T00:00:00+08:00"
+    },
+    "index": {
+      "state": "ok",
+      "compatible": true,
+      "stale": false,
+      "reasons": [],
+      "notices": [],
+      "dimension": { "index": 384, "model": 384, "recorded": 384, "declared": 384 }
+    },
+    "index_compatible": true,
+    "index_stale": false,
+    "data_dir": "…"
   }
 }
 ```
 
-`status` 为 `ok` 或 `degraded`。`degraded` 时 `detail.problems` 列出待处理项。
+`status` 为 `ok` 或 `degraded`；`degraded` 时 `detail.problems` 列出待处理项。
+`detail.index.state` 是索引一致性体检的结论：
 
-> Ollama 探测结果缓存 5 秒，因此本接口在 Ollama 不可达时也只需约 40ms。
+| state | 含义 | 后果 |
+|-------|------|------|
+| `empty` | 还没有索引 | 无 |
+| `ok` | 索引与当前嵌入 / 切分 / 解析配置一致 | 无 |
+| `stale` | 索引还能用，但内容对不上当前配置（典型：改过 `chunk_size`） | 状态转 `degraded`，建议重建索引 |
+| `incompatible` | 向量空间不符（换过嵌入模型 / 维度） | 状态转 `degraded`，**检索被拒绝**（`/api/chat`、`/api/search` 返回 409） |
+
+`reasons` 是阻断性原因，`notices` 是提醒性原因（均为可直接展示的中文文案）。
+`dimension` 对比索引实际维度、模型实际输出维度、注册表登记值与配置声明值。
+Ollama 探测缓存 5 秒、模型能力缓存 60 秒（并在切换模型 / 刷新模型列表 / 安装结束 / 重新检测时失效），故 Ollama 不可达时本接口也只需约 40ms。
 
 ---
 
 ### `GET /api/setup?fresh=false`
 
-**首次配置体检**。前端启动时调用本接口；只要 `ready` 为 `false` 就弹出安装引导窗口。
-
-返回的**安装命令由后端按当前实际安装位置生成**（不是前端硬编码），
-因此换个目录部署、换台机器，命令依然可直接复制执行。
+首次配置体检。前端启动时调用，`ready` 为 `false` 就弹出安装引导窗口；
+安装命令由后端按当前实际安装位置生成，换目录或换机器后仍可直接复制执行。
 
 ```json
 {
@@ -113,11 +139,11 @@
 | `ollama_not_running` | blocking | 找到了二进制，但服务没起来 |
 | `llm_model_missing` | blocking | 服务通了，但里面没有配置的 LLM |
 
-`fresh=true` 会绕过后端对 Ollama 的 5 秒探测缓存，用于用户装完东西后点「重新检测」。
-`ready` 的判定与 `/api/health` 的三个字段保持一致：
-`ollama_reachable && llm_model_available && embedding_ready`。
+便携版解压中断会额外报 `ollama_incomplete`（只有 `ollama.exe`、缺 `lib\ollama\` 推理运行时）。
+`fresh=true` 绕过后端 5 秒探测缓存，供用户装完后点「重新检测」。
+`ready` 与 `/api/health` 保持一致：`ollama_reachable && llm_model_available && embedding_ready`。
 
-**`environment.toolchain`** 是本机工具链探测结果，指引据此「因地制宜」：
+`environment.toolchain` 是本机工具链探测结果，指引据此「因地制宜」：
 
 ```json
 {
@@ -129,8 +155,7 @@
 }
 ```
 
-`environment.can_auto_install` 表示准备脚本是否存在 —— 前端据此决定
-是否显示「一键开始安装」按钮。
+`environment.can_auto_install` 表示准备脚本是否存在，前端据此决定是否显示「一键开始安装」。
 
 ---
 
@@ -158,7 +183,7 @@
 
 ### `POST /api/setup/install`
 
-启动安装。等价于用户手动双击 `scripts\prepare.cmd`。
+启动安装，等价于用户手动双击 `scripts\prepare.cmd`。
 
 ```json
 { "mirror": false, "skip_ollama": false }
@@ -167,7 +192,7 @@
 * `mirror` —— 传给准备脚本的 `-Mirror`，国内镜像加速
 * `skip_ollama` —— 只准备 Python 侧，跳过 1.4GB 的 Ollama 下载
 
-**同一时间只允许一个任务**，重复调用返回 `409`：
+同一时间只允许一个任务，重复调用返回 `409`：
 
 ```json
 { "detail": "已有安装任务正在运行" }
@@ -183,13 +208,11 @@ SSE 实时推送安装输出。
 | `status` | 状态快照（回放历史后发一次） |
 | `end` | 最终状态快照，随后连接关闭 |
 
-服务端会**先回放已有日志**再跟进增量，所以中途刷新页面或重新打开弹窗
-都能看到完整过程，而不是只能看后续输出。空闲时每约 10 秒发一次 `: ping` 心跳。
+服务端先回放已有日志再跟进增量，中途刷新页面也能看到完整过程；空闲时每约 10 秒发一次 `: ping`。
 
 ### `POST /api/setup/install/cancel`
 
-取消正在运行的任务。按**进程树**终止（`taskkill /T`）——
-准备脚本下面还有 python、ollama 等子进程，只杀 PowerShell 本身会留下孤儿。
+取消正在运行的任务。按进程树终止（`taskkill /T`），只杀 PowerShell 会留下 python、ollama 等孤儿进程。
 
 ### `POST /api/setup/install/reset`
 
@@ -199,23 +222,51 @@ SSE 实时推送安装输出。
 
 ### `GET /api/config` / `PUT /api/config`
 
-读取 / 运行期修改检索与生成参数。**只作用于当前进程**，要永久生效请写入 `.env`。
-
-`PUT` 请求体（字段都可选）：
+读取 / 运行期修改运行参数。**只作用于当前进程**，要永久生效请写入 `.env`。
+两个方向的字段表完全一致（29 项），响应结构与 `GET` 相同；未传或传 `null` 表示「不动」，
+传了但值没变视为空操作，不触发重建/重置副作用。
 
 ```json
 {
   "llm_model": "llama3.2",
   "llm_temperature": 0.1,
-  "top_k": 4,
-  "score_threshold": 0.2,
+  "llm_num_ctx": 8192,
+  "llm_num_predict": 2048,
+  "llm_repeat_penalty": 1.2,
+  "llm_repeat_last_n": 512,
+  "expose_thinking": true,
+  "embedding_model_name": "sentence-transformers/all-MiniLM-L6-v2",
+  "embedding_device": "cpu",
+  "embedding_dimension": 384,
   "chunk_size": 800,
   "chunk_overlap": 120,
-  "expose_thinking": true
+  "strip_boilerplate": true,
+  "restore_pdf_paragraphs": true,
+  "strip_references": true,
+  "pdf_min_chars_per_page": 120,
+  "top_k": 4,
+  "score_threshold": 0.2,
+  "score_window": 0.12,
+  "score_floor": 0.1,
+  "score_relax_limit": 0.35,
+  "dedupe_ratio": 0.8,
+  "max_context_chars": 6000,
+  "summary_max_chunks": 10,
+  "max_upload_mb": 50,
+  "allowed_extensions": [".txt", ".md"],
+  "max_history_turns": 6,
+  "backup_before_reindex": true,
+  "index_backup_keep": 3
 }
 ```
 
-修改 `llm_model` 或 `llm_temperature` 会重置已缓存的 ChatOllama 客户端。
+副作用与校验：
+
+* 改 `llm_model` / 生成参数 → 重置已缓存的 ChatOllama 客户端，并让 Ollama 探测缓存失效；
+* 改 `embedding_model_name` / `embedding_device` / `embedding_dimension` → 重置嵌入实例与内存索引，不一致时 `/api/health` 报 `incompatible`、检索 409，**需要重建索引**；
+* 改 `chunk_size` / `chunk_overlap` / 解析开关 → 旧索引不重算，`/api/health` 报 `stale` 并建议重建；
+* `chunk_overlap >= chunk_size` → **400**（切分器会死循环或报错）；
+* `allowed_extensions` 归一化成小写带点（`.txt`）并保序去重，只填空白 → **400**。
 
 ---
 
@@ -259,13 +310,17 @@ SSE 实时推送安装输出。
       "char_count": 8642,
       "created_at": "2026-01-01T10:00:00+08:00",
       "status": "indexed",
-      "error": null
+      "error": null,
+      "warnings": []
     }
   ],
   "total": 1,
   "total_chunks": 12
 }
 ```
+
+`warnings` 是给用户看的解析警告（前端显示「⚠ 解析警告」徽标，tooltip 为完整文案）；
+目前只有一类：多页 PDF 平均每页字符数低于 `RAG_PDF_MIN_CHARS_PER_PAGE`（默认 120）时判定「疑似扫描件 / 图片版」。
 
 ---
 
@@ -278,18 +333,22 @@ curl -X POST http://127.0.0.1:8000/api/documents/upload \
      -F "files=@doc1.pdf" -F "files=@doc2.md"
 ```
 
-响应是**每个文件一项**的数组。单个文件失败不会中断整批：
+响应是每个文件一项的数组，单个文件失败不会中断整批：
 
 ```json
 [
-  { "document": { "doc_id": "…", "status": "indexed", "chunk_count": 12 }, "message": "《doc1.pdf》索引完成，共 12 个分块" },
+  { "document": { "doc_id": "…", "status": "indexed", "chunk_count": 12, "warnings": [] }, "message": "《doc1.pdf》索引完成，共 12 个分块" },
+  { "document": { "doc_id": "…", "status": "indexed", "chunk_count": 0, "warnings": ["疑似扫描件 / 图片版 PDF：…"] }, "message": "《scan.pdf》索引完成，共 0 个分块；⚠ 疑似扫描件 / 图片版 PDF：…" },
   { "document": { "doc_id": "", "status": "failed", "error": "不支持的文件类型：.exe" }, "message": "《x.exe》入库失败：…" }
 ]
 ```
 
+第二种是「入库成功但有警告」：警告同时出现在 `message` 与 `document.warnings` 里，前端会额外弹一条 toast。
+
 * 支持类型：`.txt .md .markdown .pdf .docx .csv .log .json`
 * 大小上限：默认 50MB（`RAG_MAX_UPLOAD_MB`）
 * **内容去重**：sha256 相同的文件不会重复索引，直接复用已有记录并返回 `indexed`
+* 索引与当前嵌入配置不一致时上传被拒绝（`IndexIncompatibleError`），请先重建索引
 
 ---
 
@@ -311,6 +370,31 @@ curl -X POST http://127.0.0.1:8000/api/documents/upload \
 
 ---
 
+### `POST /api/documents/reindex`
+
+用 `data/uploads/` 里的原始文件按当前解析 / 切分 / 嵌入配置重建整个索引。
+改了 `chunk_size`、解析开关或换过嵌入模型后都必须走这一步（旧索引不会自动更新）；知识库为空时返回 `409`。
+
+```json
+{
+  "documents": 2,
+  "rebuilt": 2,
+  "failed": 0,
+  "chunks_before": 31,
+  "chunks_after": 58,
+  "index_state_before": "stale",
+  "rebuilt_from_scratch": false,
+  "backup_dir": "…/data/index/backups/20260101-101500",
+  "details": [ { "doc_id": "…", "filename": "a.pdf", "status": "ok", "chunks_before": 12, "chunks_after": 24, "char_count": 8642, "warnings": [] } ]
+}
+```
+
+* `index_state_before` / `rebuilt_from_scratch`：向量空间没变则逐篇替换向量，变了（维度/模型不同）则先整体清空再重新向量化；
+* `backup_dir`：重建前自动备份的目录（`RAG_BACKUP_BEFORE_REINDEX`，保留 `RAG_INDEX_BACKUP_KEEP` 份）；还原时把其中的 `.faiss` / `.pkl` 拷回 `data/index/` 即可；
+* `details[].warnings`：本次重新解析得到的面向用户的警告（换了文字版后会自行消失）。
+
+---
+
 ### `DELETE /api/documents/{doc_id}`
 
 删除文档及其全部向量。文档不存在返回 `404`。
@@ -329,8 +413,7 @@ curl -X POST http://127.0.0.1:8000/api/documents/upload \
 
 ### `POST /api/chat`
 
-**流式**（`stream: true`，默认）返回 `text/event-stream`。
-**非流式**（`stream: false`）返回一次性 JSON。
+**流式**（`stream: true`，默认）返回 `text/event-stream`；**非流式**（`stream: false`）返回一次性 JSON。
 
 请求体：
 
@@ -349,13 +432,14 @@ curl -X POST http://127.0.0.1:8000/api/documents/upload \
 ```
 
 `doc_ids` 为空或省略时检索全部文档。
+状态码：知识库为空 → `409`；索引与当前嵌入配置不一致 → `409`（`detail` 是中文的「去点重建索引」指引）；LLM 不可用 → `503`。
+流式路径下的索引不一致以 `error` 事件下发（`stage: retrieve`），不会白等一次推理。
 
-**SSE 事件序列**：`meta` → (`thinking`)\* → (`token`)\* → `sources` → `done`
-出错时在任意位置插入 `error` 并结束。
+**SSE 事件序列**：`meta` → (`thinking`)\* → (`token`)\* → `sources` → `done`；出错时在任意位置插入 `error` 并结束。
 
 | 事件 | 数据 |
 |------|------|
-| `meta` | `{model, top_k, score_threshold, source_count}` |
+| `meta` | `{model, mode, top_k, score_threshold, effective_threshold, best_score, relaxed, candidates, chunks_total, source_count}` |
 | `thinking` | `{delta}` — 推理链增量，可通过 `expose_thinking=false` 关闭 |
 | `token` | `{delta}` — 正文增量（已剥离推理链） |
 | `sources` | `{sources, cited, thinking}` — `sources` 为召回片段，`cited` 为回答中真正引用的编号 |
@@ -376,7 +460,7 @@ curl -X POST http://127.0.0.1:8000/api/documents/upload \
 }
 ```
 
-`score` 是**余弦相似度**（向量已归一化，FAISS 用内积检索），越高越相关。
+`score` 是余弦相似度（向量已归一化，FAISS 用内积检索），越高越相关。
 
 **SSE 原始报文示例**
 

@@ -11,7 +11,7 @@ from app.core.logging import get_logger
 from app.core.sse import stream_with_heartbeat
 from app.schemas import ChatRequest, ChatResponse, SearchRequest, SearchResponse
 from app.services.rag import LLMUnavailableError, rag_service
-from app.services.vectorstore import vector_store
+from app.services.vectorstore import IndexIncompatibleError, vector_store
 
 logger = get_logger(__name__)
 
@@ -28,9 +28,8 @@ _SSE_HEADERS = {
 async def chat(payload: ChatRequest):
     """RAG 问答。
 
-    ``stream=true`` 返回 ``text/event-stream``，事件序列为：
-    ``meta`` → (``thinking``)* → (``token``)* → ``sources`` → ``done``
-    ``stream=false`` 返回一次性 JSON。
+    ``stream=true`` 返回 ``text/event-stream``，事件序列为 ``meta`` → (``thinking``)*
+    → (``token``)* → ``sources`` → ``done``；``stream=false`` 返回一次性 JSON。
     """
     if not vector_store.ready and not vector_store.exists_on_disk():
         raise HTTPException(
@@ -47,6 +46,10 @@ async def chat(payload: ChatRequest):
                 score_threshold=payload.score_threshold,
                 doc_ids=payload.doc_ids,
             )
+        except IndexIncompatibleError as exc:
+            # 索引与当前嵌入配置不一致 → 409 而不是 500：这不是服务端故障，
+            # 而是有明确出路的状态（重建索引 / 改回原模型）。
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except LLMUnavailableError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return ChatResponse(
@@ -81,15 +84,17 @@ async def chat(payload: ChatRequest):
 async def search(payload: SearchRequest) -> SearchResponse:
     """纯检索接口：只返回相关片段，不调用 LLM（便于调参与排错）。
 
-    返回体里的 ``info`` 会带上这一轮检索的实际生效阈值、是否放宽、最佳分数等，
-    方便解释「为什么这条没被召回」。
+    返回体的 ``info`` 会带上本轮实际生效阈值、是否放宽、最佳分数，便于解释「为什么没召回」。
     """
     started = time.perf_counter()
-    results, info = vector_store.search_detailed(
-        query=payload.query,
-        top_k=payload.top_k,
-        score_threshold=payload.score_threshold,
-    )
+    try:
+        results, info = vector_store.search_detailed(
+            query=payload.query,
+            top_k=payload.top_k,
+            score_threshold=payload.score_threshold,
+        )
+    except IndexIncompatibleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return SearchResponse(
         query=payload.query,
         results=results,
